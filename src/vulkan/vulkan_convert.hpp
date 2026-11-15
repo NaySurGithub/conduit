@@ -276,6 +276,8 @@ namespace conduit::vk {
             out |= VK_SHADER_STAGE_FRAGMENT_BIT;
         if (s & shader_stage::compute)
             out |= VK_SHADER_STAGE_COMPUTE_BIT;
+        if (s & shader_stage::geometry)
+            out |= VK_SHADER_STAGE_GEOMETRY_BIT;
         return out;
     }
 

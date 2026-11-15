@@ -273,6 +273,7 @@ namespace conduit::vk {
         ef.independentBlend = sf.independentBlend;
         ef.fillModeNonSolid = sf.fillModeNonSolid;
         ef.depthClamp = sf.depthClamp;
+        ef.geometryShader = sf.geometryShader;
         ef.depthBiasClamp = sf.depthBiasClamp;
         ef.shaderInt64 = sf.shaderInt64;
         ef.shaderFloat64 = sf.shaderFloat64;
@@ -501,6 +502,7 @@ namespace conduit::vk {
         caps_.features.dedicated_copy_queue =
             queues_[2].queue != queues_[0].queue && queues_[2].queue != queues_[1].queue;
         caps_.features.mesh_shaders = phys_.has("VK_EXT_mesh_shader");
+        caps_.features.geometry_shaders = sup2.features.geometryShader != VK_FALSE;
         caps_.features.work_graphs = phys_.has("VK_AMDX_shader_enqueue");
         caps_.features.gpu_driven = caps_.features.multi_draw_indirect && caps_.features.draw_indirect_count;
         caps_.features.ray_tracing = phys_.has("VK_KHR_ray_query") && phys_.has("VK_KHR_acceleration_structure");
@@ -1230,8 +1232,8 @@ namespace conduit::vk {
     }
 
     struct device::pipeline_job {
-        std::string name, vs_entry, fs_entry;
-        VkPipelineShaderStageCreateInfo stages[2]{};
+        std::string name, vs_entry, fs_entry, gs_entry;
+        VkPipelineShaderStageCreateInfo stages[3]{};
         VkVertexInputBindingDescription bindings[max_vertex_streams]{};
         VkVertexInputAttributeDescription attrs[max_vertex_attributes]{};
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1330,6 +1332,9 @@ namespace conduit::vk {
         job->name = desc.name ? desc.name : "";
         job->vs_entry = vs->entry;
         job->fs_entry = fs ? fs->entry : std::string();
+        shader_rec* gs = shaders_.get(desc.geometry);
+        if (gs)
+            job->gs_entry = gs->entry;
         auto& stages = job->stages;
         uint32_t stage_count = 0;
         stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1339,6 +1344,14 @@ namespace conduit::vk {
                                  vs->module,
                                  job->vs_entry.c_str(),
                                  nullptr};
+        if (gs)
+            stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                     nullptr,
+                                     0,
+                                     VK_SHADER_STAGE_GEOMETRY_BIT,
+                                     gs->module,
+                                     job->gs_entry.c_str(),
+                                     nullptr};
         if (fs)
             stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                      nullptr,

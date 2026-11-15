@@ -71,6 +71,7 @@ namespace conduit {
         bool shader_float64 = false;
         bool subgroup_ops = false;
         bool mesh_shaders = false;
+        bool geometry_shaders = false;
         bool ray_tracing = false;
         bool variable_rate_shading = false;
         bool cooperative_vector = false;

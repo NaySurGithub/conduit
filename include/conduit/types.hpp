@@ -132,8 +132,9 @@ namespace conduit {
         vertex = 1,
         fragment = 2,
         compute = 4,
-        all_graphics = vertex | fragment,
-        all = vertex | fragment | compute
+        geometry = 8,
+        all_graphics = vertex | fragment | geometry,
+        all = vertex | fragment | compute | geometry
     };
     constexpr shader_stage operator|(shader_stage a, shader_stage b) {
         return static_cast<shader_stage>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
@@ -407,6 +408,7 @@ namespace conduit {
     struct graphics_pipeline_desc {
         shader_handle vertex;
         shader_handle fragment;
+        shader_handle geometry;
         pipeline_layout_handle layout;
         std::array<vertex_stream_desc, max_vertex_streams> streams{};
         uint32_t stream_count = 0;
