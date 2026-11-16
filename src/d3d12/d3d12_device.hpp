@@ -409,6 +409,7 @@ namespace conduit::d3d12 {
         void wait_idle() override;
 
         memory_budget query_memory_budget() override;
+        bool lost() const override { return device_ && device_->GetDeviceRemovedReason() != S_OK; }
         device_stats stats() const override;
         winrt::com_ptr<ID3D12PipelineState> ready_pipeline(const pipeline_rec& p);
         std::vector<uint8_t> serialize_pipeline_cache() override;

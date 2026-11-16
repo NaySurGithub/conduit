@@ -328,6 +328,7 @@ namespace conduit {
         virtual void wait_idle() = 0;
 
         virtual memory_budget query_memory_budget() = 0;
+        virtual bool lost() const { return false; }
         virtual device_stats stats() const = 0;
         virtual std::vector<uint8_t> serialize_pipeline_cache() { return {}; }
         virtual std::string debug_report() { return {}; }
