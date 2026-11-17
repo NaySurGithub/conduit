@@ -244,6 +244,11 @@ namespace conduit::vk {
         dynamic_rendering_ = api13 ? sup13.dynamicRendering != 0 : (ext_render && sup_dr.dynamicRendering);
         sync2_ = api13 ? sup13.synchronization2 != 0 : (ext_sync2 && sup_s2.synchronization2);
         timeline_native_ = f_timeline;
+        if (std::getenv("CONDUIT_VK_LEGACY")) {
+            dynamic_rendering_ = false;
+            sync2_ = false;
+            timeline_native_ = false;
+        }
 
         VkPhysicalDeviceFeatures2 en2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
