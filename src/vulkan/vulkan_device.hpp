@@ -488,6 +488,7 @@ namespace conduit::vk {
         std::atomic<uint64_t> pipelines_pending_{0};
 
         retire_queue retire_;
+        bool in_frame_ = false;
         uint64_t frame_ = 0;
         uint32_t slot_ = 0;
         std::vector<queue_serials> slot_serials_;

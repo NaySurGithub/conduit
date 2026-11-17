@@ -6,6 +6,27 @@
 #include <cstring>
 
 namespace conduit::vk {
+    namespace {
+        template <class T, size_t N> class small_array {
+        public:
+            explicit small_array(size_t capacity) {
+                if (capacity > N) {
+                    heap_.resize(capacity);
+                    data_ = heap_.data();
+                }
+            }
+            void push(const T& value) { data_[size_++] = value; }
+            const T* data() const { return data_; }
+            size_t size() const { return size_; }
+
+        private:
+            T inline_[N];
+            std::vector<T> heap_;
+            T* data_ = inline_;
+            size_t size_ = 0;
+        };
+    }
+
     void cmd_list::fail(const std::string& message) {
         device_.report_error(message);
     }
@@ -212,8 +233,7 @@ namespace conduit::vk {
             return;
         }
         const format_info& fi = get_format_info(t->desc.format);
-        std::vector<VkBufferImageCopy> copies;
-        copies.reserve(regions.size());
+        small_array<VkBufferImageCopy, 16> copies(regions.size());
         for (const buffer_texture_copy& r : regions) {
             if (device_.use_validator_) {
                 device_.validator_.expect_buffer(src, state::copy_src, "CopyBufferToTexture src");
@@ -228,7 +248,7 @@ namespace conduit::vk {
                 r.mip, r.layer, 1};
             c.imageOffset = {static_cast<int32_t>(r.x), static_cast<int32_t>(r.y), static_cast<int32_t>(r.z)};
             c.imageExtent = {r.width, r.height, r.depth};
-            copies.push_back(c);
+            copies.push(c);
         }
         device_.fn_.vkCmdCopyBufferToImage(cmd_, b->buffer, t->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                            static_cast<uint32_t>(copies.size()), copies.data());
@@ -243,8 +263,7 @@ namespace conduit::vk {
             return;
         }
         const format_info& fi = get_format_info(t->desc.format);
-        std::vector<VkBufferImageCopy> copies;
-        copies.reserve(regions.size());
+        small_array<VkBufferImageCopy, 16> copies(regions.size());
         for (const buffer_texture_copy& r : regions) {
             if (device_.use_validator_) {
                 device_.validator_.expect_buffer(dst, state::copy_dst, "CopyTextureToBuffer dst");
@@ -259,7 +278,7 @@ namespace conduit::vk {
                 r.mip, r.layer, 1};
             c.imageOffset = {static_cast<int32_t>(r.x), static_cast<int32_t>(r.y), static_cast<int32_t>(r.z)};
             c.imageExtent = {r.width, r.height, r.depth};
-            copies.push_back(c);
+            copies.push(c);
         }
         device_.fn_.vkCmdCopyImageToBuffer(cmd_, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, b->buffer,
                                            static_cast<uint32_t>(copies.size()), copies.data());
@@ -272,8 +291,7 @@ namespace conduit::vk {
             fail("CopyTexture: unknown texture");
             return;
         }
-        std::vector<VkImageCopy> copies;
-        copies.reserve(regions.size());
+        small_array<VkImageCopy, 16> copies(regions.size());
         for (const texture_copy& r : regions) {
             if (device_.use_validator_) {
                 device_.validator_.expect_texture(src, {r.src_mip, 1, r.src_layer, 1}, state::copy_src,
@@ -287,7 +305,7 @@ namespace conduit::vk {
             c.srcOffset = {static_cast<int32_t>(r.src_x), static_cast<int32_t>(r.src_y), 0};
             c.dstOffset = {static_cast<int32_t>(r.dst_x), static_cast<int32_t>(r.dst_y), 0};
             c.extent = {r.width, r.height, 1};
-            copies.push_back(c);
+            copies.push(c);
         }
         device_.fn_.vkCmdCopyImage(cmd_, s->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, d->image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copies.size()),
@@ -518,9 +536,17 @@ namespace conduit::vk {
                     dirty_sets_ |= 1u << i;
             push_dirty_ = push_used_ != 0;
         }
-        pipeline_ = *p;
         pipeline_.pipeline = native;
-        pipeline_.build.reset();
+        pipeline_.bind_point = p->bind_point;
+        pipeline_.layout_handle = p->layout_handle;
+        pipeline_.layout = p->layout;
+        pipeline_.push_stages = p->push_stages;
+        pipeline_.push_bytes = p->push_bytes;
+        pipeline_.color_count = p->color_count;
+        pipeline_.color_formats = p->color_formats;
+        pipeline_.depth_format = p->depth_format;
+        pipeline_.stream_count = p->stream_count;
+        pipeline_.compute = p->compute;
         pipeline_handle_ = handle;
         have_pipeline_ = true;
         device_.fn_.vkCmdBindPipeline(cmd_, p->bind_point, native);
@@ -561,13 +587,19 @@ namespace conduit::vk {
 
     void cmd_list::set_viewport(const viewport& v) {
         // negative height keeps clip space y-up like d3d, with no change to shaders or winding
-        viewport_ = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+        const VkViewport next = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+        if (have_viewport_ && !invalid_ && std::memcmp(&next, &viewport_, sizeof(next)) == 0)
+            return;
+        viewport_ = next;
         have_viewport_ = true;
         device_.fn_.vkCmdSetViewport(cmd_, 0, 1, &viewport_);
     }
 
     void cmd_list::set_scissor(const rect& r) {
-        scissor_ = {{r.x, r.y}, {r.width, r.height}};
+        const VkRect2D next = {{r.x, r.y}, {r.width, r.height}};
+        if (have_scissor_ && !invalid_ && std::memcmp(&next, &scissor_, sizeof(next)) == 0)
+            return;
+        scissor_ = next;
         have_scissor_ = true;
         device_.fn_.vkCmdSetScissor(cmd_, 0, 1, &scissor_);
     }

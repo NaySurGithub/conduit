@@ -53,6 +53,25 @@ static void test_retire() {
     done[0] = 1;
     q.collect(done);
     CHECK(freed == 1);
+
+    int late = 0;
+    q.defer([&] { late++; });
+    done[0] = 100;
+    q.collect(done);
+    CHECK(late == 0);
+    CHECK(q.pending() == 1);
+    queue_serials frame{};
+    frame[0] = 101;
+    q.seal(frame);
+    q.collect(done);
+    CHECK(late == 0);
+    done[0] = 101;
+    q.collect(done);
+    CHECK(late == 1);
+    CHECK(q.pending() == 0);
+    q.defer([&] { late++; });
+    q.flush_all();
+    CHECK(late == 2);
 }
 
 static void test_copies() {

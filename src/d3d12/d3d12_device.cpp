@@ -1137,10 +1137,7 @@ namespace conduit::d3d12 {
     }
 
     void device::retire(std::function<void()> release) {
-        queue_serials snapshot;
-        for (size_t i = 0; i < queue_count; i++)
-            snapshot[i] = queues_[i].serial.load();
-        retire_.push(snapshot, std::move(release));
+        retire_.defer(std::move(release));
     }
 
     void device::destroy(buffer_handle h) {
@@ -1389,8 +1386,15 @@ namespace conduit::d3d12 {
     }
 
     void device::begin_frame() {
+        if (in_frame_) {
+            queue_serials now;
+            for (size_t i = 0; i < queue_count; i++)
+                now[i] = queues_[i].serial.load();
+            retire_.seal(now);
+        }
         frame_++;
         slot_ = static_cast<uint32_t>(frame_ % options_.frames_in_flight);
+        in_frame_ = true;
         const queue_serials& need = slot_serials_[slot_];
         for (size_t i = 0; i < queue_count; i++) {
             if (!need[i] || !queues_[i].fence)
@@ -1414,6 +1418,8 @@ namespace conduit::d3d12 {
     void device::end_frame() {
         for (size_t i = 0; i < queue_count; i++)
             slot_serials_[slot_][i] = queues_[i].serial.load();
+        in_frame_ = false;
+        retire_.seal(slot_serials_[slot_]);
         retire_.collect(completed());
     }
 
@@ -1427,6 +1433,12 @@ namespace conduit::d3d12 {
             std::lock_guard lock(wait_mutex_);
             queues_[i].fence->SetEventOnCompletion(target, wait_event_.get());
             WaitForSingleObject(wait_event_.get(), INFINITE);
+        }
+        if (!in_frame_) {
+            queue_serials now;
+            for (size_t i = 0; i < queue_count; i++)
+                now[i] = queues_[i].serial.load();
+            retire_.seal(now);
         }
         retire_.collect(completed());
     }

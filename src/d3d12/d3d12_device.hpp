@@ -338,6 +338,10 @@ namespace conduit::d3d12 {
         D3D12_RECT scissor_{};
         bool have_viewport_ = false, have_scissor_ = false;
         std::vector<std::pair<winrt::com_ptr<ID3D12Resource>, winrt::com_ptr<D3D12MA::Allocation>>> temps_;
+        winrt::com_ptr<ID3D12Resource> fill_staging_;
+        winrt::com_ptr<D3D12MA::Allocation> fill_alloc_;
+        uint64_t fill_size_ = 0;
+        uint32_t fill_value_ = 0;
     };
 
     struct thread_pools {
@@ -425,6 +429,8 @@ namespace conduit::d3d12 {
         void report_error(const std::string& message);
         queue_serials completed();
         void check_removed(HRESULT hr, const char* what);
+        void report_removal_details();
+        bool removal_reported_ = false;
         void signal_serial(queue_type q);
 
         instance_state& instance_info() const { return *inst_; }
@@ -506,6 +512,7 @@ namespace conduit::d3d12 {
         std::mutex frame_group_mutex_;
 
         retire_queue retire_;
+        bool in_frame_ = false;
         uint64_t frame_ = 0;
         uint32_t slot_ = 0;
         std::vector<queue_serials> slot_serials_;

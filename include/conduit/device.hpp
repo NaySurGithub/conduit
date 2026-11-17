@@ -128,6 +128,7 @@ namespace conduit {
 
     struct instance_options {
         bool validation = false;
+        bool crash_diagnostics = false;
         const char* app_name = "conduit";
         vendor_hooks hooks;
     };

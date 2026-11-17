@@ -654,10 +654,7 @@ namespace conduit::vk {
     }
 
     void device::retire(std::function<void()> release) {
-        queue_serials snapshot;
-        for (size_t i = 0; i < queue_count; i++)
-            snapshot[i] = queues_[i].serial.load();
-        retire_.push(snapshot, std::move(release));
+        retire_.defer(std::move(release));
     }
 
     buffer_handle device::create_buffer(const buffer_desc& desc) {
@@ -1779,8 +1776,11 @@ namespace conduit::vk {
 
     void device::submit(conduit::queue_type queue_type, const submit_desc& desc) {
         queue_info& q = queues_[static_cast<size_t>(queue_type)];
-        std::vector<VkCommandBuffer> cmds;
-        cmds.reserve(desc.lists.size());
+        thread_local std::vector<VkCommandBuffer> cmds;
+        thread_local std::vector<timeline_op> waits, signals;
+        cmds.clear();
+        waits.clear();
+        signals.clear();
         for (command_list* list : desc.lists) {
             auto* vk_list = static_cast<cmd_list*>(list);
             if (vk_list->open_labels() != 0)
@@ -1790,7 +1790,6 @@ namespace conduit::vk {
             cmds.push_back(vk_list->cmd());
         }
 
-        std::vector<timeline_op> waits, signals;
         for (const fence_op& w : desc.waits)
             if (fence_rec* f = fences_.get(w.fence))
                 waits.push_back({f->timeline.get(), w.value});
@@ -1823,14 +1822,16 @@ namespace conduit::vk {
                                   std::span<const timeline_op> waits, std::span<const timeline_op> signals,
                                   VkSemaphore binary_wait, VkSemaphore binary_signal) {
         if (timeline_native_ && sync2_) {
-            std::vector<VkCommandBufferSubmitInfo> infos;
-            infos.reserve(cmds.size());
+            thread_local std::vector<VkCommandBufferSubmitInfo> infos;
+            thread_local std::vector<VkSemaphoreSubmitInfo> wait_infos, signal_infos;
+            infos.clear();
+            wait_infos.clear();
+            signal_infos.clear();
             for (VkCommandBuffer c : cmds) {
                 VkCommandBufferSubmitInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
                 ci.commandBuffer = c;
                 infos.push_back(ci);
             }
-            std::vector<VkSemaphoreSubmitInfo> wait_infos, signal_infos;
             auto sem_info = [](VkSemaphore s, uint64_t value) {
                 VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
                 i.semaphore = s;
@@ -2267,8 +2268,15 @@ namespace conduit::vk {
     }
 
     void device::begin_frame() {
+        if (in_frame_) {
+            queue_serials now;
+            for (size_t i = 0; i < queue_count; i++)
+                now[i] = queues_[i].serial.load();
+            retire_.seal(now);
+        }
         frame_++;
         slot_ = static_cast<uint32_t>(frame_ % options_.frames_in_flight);
+        in_frame_ = true;
 
         const queue_serials& need = slot_serials_[slot_];
         for (size_t i = 0; i < queue_count; i++) {
@@ -2288,11 +2296,19 @@ namespace conduit::vk {
     void device::end_frame() {
         for (size_t i = 0; i < queue_count; i++)
             slot_serials_[slot_][i] = queues_[i].serial.load();
+        in_frame_ = false;
+        retire_.seal(slot_serials_[slot_]);
         retire_.collect(completed());
     }
 
     void device::wait_idle() {
         fn_.vkDeviceWaitIdle(device_);
+        if (!in_frame_) {
+            queue_serials now;
+            for (size_t i = 0; i < queue_count; i++)
+                now[i] = queues_[i].serial.load();
+            retire_.seal(now);
+        }
         retire_.collect(completed());
     }
 

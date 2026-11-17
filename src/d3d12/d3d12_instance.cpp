@@ -70,6 +70,16 @@ namespace conduit::d3d12 {
                         factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
                     }
                 }
+#if defined(__ID3D12DeviceRemovedExtendedDataSettings1_INTERFACE_DEFINED__)
+                if (options_.crash_diagnostics && lib.get_debug_interface) {
+                    winrt::com_ptr<ID3D12DeviceRemovedExtendedDataSettings1> dred;
+                    if (SUCCEEDED(lib.get_debug_interface(winrt::guid_of<ID3D12DeviceRemovedExtendedDataSettings1>(),
+                                                          dred.put_void()))) {
+                        dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                        dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
+                }
+#endif
                 if (FAILED(lib.create_factory2(factory_flags, winrt::guid_of<IDXGIFactory4>(),
                                                state_->factory.put_void())))
                     return false;
@@ -451,10 +461,59 @@ namespace conduit::d3d12 {
         std::fprintf(stderr, "[rhi/d3d12] %s\n", message.c_str());
     }
 
+    void device::report_removal_details() {
+        if (removal_reported_)
+            return;
+        removal_reported_ = true;
+#if defined(__ID3D12DeviceRemovedExtendedData1_INTERFACE_DEFINED__)
+        static const char* const ops[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
+                                          "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion",
+                                          "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
+                                          "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier",
+                                          "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission",
+                                          "EndSubmission"};
+        winrt::com_ptr<ID3D12DeviceRemovedExtendedData1> data;
+        if (FAILED(device_->QueryInterface(winrt::guid_of<ID3D12DeviceRemovedExtendedData1>(), data.put_void()))) {
+            std::fprintf(stderr, "[rhi/d3d12] removal details unavailable\n");
+            return;
+        }
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs{};
+        if (SUCCEEDED(data->GetAutoBreadcrumbsOutput1(&crumbs))) {
+            for (const D3D12_AUTO_BREADCRUMB_NODE1* n = crumbs.pHeadAutoBreadcrumbNode; n; n = n->pNext) {
+                if (!n->pLastBreadcrumbValue || !n->pCommandHistory)
+                    continue;
+                const UINT done = *n->pLastBreadcrumbValue;
+                if (done >= n->BreadcrumbCount)
+                    continue;
+                std::string line = "[rhi/d3d12] command list hung after " + std::to_string(done) + " of " +
+                                   std::to_string(n->BreadcrumbCount) + " ops; recent:";
+                const UINT from = done > 6 ? done - 6 : 0;
+                for (UINT i = from; i < std::min<UINT>(n->BreadcrumbCount, done + 4); i++) {
+                    const UINT op = static_cast<UINT>(n->pCommandHistory[i]);
+                    line += std::string(i == done ? " >>" : " ") + (op < sizeof(ops) / sizeof(ops[0]) ? ops[op] : "op" + std::to_string(op));
+                }
+                std::fprintf(stderr, "%s\n", line.c_str());
+            }
+        }
+        D3D12_DRED_PAGE_FAULT_OUTPUT1 fault{};
+        if (SUCCEEDED(data->GetPageFaultAllocationOutput1(&fault)) && fault.PageFaultVA) {
+            std::fprintf(stderr, "[rhi/d3d12] gpu page fault at address %llx\n",
+                         static_cast<unsigned long long>(fault.PageFaultVA));
+            for (const D3D12_DRED_ALLOCATION_NODE1* n = fault.pHeadExistingAllocationNode; n; n = n->pNext)
+                std::fprintf(stderr, "[rhi/d3d12]   live allocation near fault: %s\n",
+                             n->ObjectNameA ? n->ObjectNameA : "(unnamed)");
+            for (const D3D12_DRED_ALLOCATION_NODE1* n = fault.pHeadRecentFreedAllocationNode; n; n = n->pNext)
+                std::fprintf(stderr, "[rhi/d3d12]   recently freed allocation near fault: %s\n",
+                             n->ObjectNameA ? n->ObjectNameA : "(unnamed)");
+        }
+#endif
+    }
+
     void device::check_removed(HRESULT hr, const char* what) {
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG) {
             report_error(std::string(what) + ": device removed (reason " +
                          std::to_string(device_->GetDeviceRemovedReason()) + ")");
+            report_removal_details();
         } else if (FAILED(hr)) {
             report_error(std::string(what) + " failed (" + std::to_string(static_cast<long>(hr)) + ")");
         }

@@ -326,10 +326,16 @@ namespace conduit::d3d12 {
         if (size == ~0ull || size == 0)
             size = b->desc.size - offset;
 
-        // no fill command in d3d12: stage the pattern in an upload buffer and copy it
+        // no fill command in d3d12: stage the pattern in an upload buffer and copy it. The staging buffer stays with
+        // the list, so a fill that repeats every frame allocates and writes it once
+        if (fill_staging_ && fill_value_ == value && fill_size_ >= size) {
+            list_->CopyBufferRegion(b->resource.get(), offset, fill_staging_.get(), 0, size);
+            return;
+        }
+        const uint64_t staging_size = (std::max<uint64_t>)(size, 64ull << 10);
         D3D12_RESOURCE_DESC rd{};
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd.Width = size;
+        rd.Width = staging_size;
         rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -349,10 +355,15 @@ namespace conduit::d3d12 {
             return;
         }
         auto* words = static_cast<uint32_t*>(mapped);
-        std::fill(words, words + size / 4, value);
+        std::fill(words, words + staging_size / 4, value);
         res->Unmap(0, nullptr);
         list_->CopyBufferRegion(b->resource.get(), offset, res.get(), 0, size);
-        temps_.emplace_back(std::move(res), std::move(alloc));
+        if (fill_staging_)
+            temps_.emplace_back(std::move(fill_staging_), std::move(fill_alloc_));
+        fill_staging_ = std::move(res);
+        fill_alloc_ = std::move(alloc);
+        fill_size_ = staging_size;
+        fill_value_ = value;
     }
 
     void cmd_list::resolve_texture(texture_handle dst, texture_handle src) {
@@ -698,6 +709,8 @@ namespace conduit::d3d12 {
             vertex_dirty_ = 0;
         }
 
+        if (!dirty_sets_ && !push_dirty_)
+            return;
         pipeline_layout_rec* layout = device_.pipeline_layouts_.get(layout_handle_);
         if (!layout)
             return;
