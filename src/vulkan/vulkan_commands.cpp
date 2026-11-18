@@ -530,7 +530,7 @@ namespace conduit::vk {
             return;
         }
         pipeline_pending_ = false;
-        if (!have_pipeline_ || pipeline_.layout != p->layout) {
+        if (!have_pipeline_ || pipeline_.layout != p->layout || pipeline_.bind_point != p->bind_point) {
             for (uint32_t i = 0; i < max_bind_groups; i++)
                 if (groups_[i])
                     dirty_sets_ |= 1u << i;
