@@ -124,6 +124,11 @@ namespace conduit {
     void state_validator::expect_texture(texture_handle handle, const subresource_range& range, conduit::state want,
                                          const char* what) {
         std::lock_guard lock(mutex_);
+        expect_texture_locked(handle, range, want, what);
+    }
+
+    void state_validator::expect_texture_locked(texture_handle handle, const subresource_range& range,
+                                                conduit::state want, const char* what) {
         auto it = textures_.find(handle.value);
         if (it == textures_.end()) {
             report(std::string(what) + ": unknown texture");
@@ -149,6 +154,10 @@ namespace conduit {
 
     void state_validator::expect_buffer(buffer_handle handle, state want, const char* what) {
         std::lock_guard lock(mutex_);
+        expect_buffer_locked(handle, want, what);
+    }
+
+    void state_validator::expect_buffer_locked(buffer_handle handle, state want, const char* what) {
         auto it = buffers_.find(handle.value);
         if (it == buffers_.end()) {
             report(std::string(what) + ": unknown buffer");
@@ -165,11 +174,14 @@ namespace conduit {
     }
 
     void state_validator::expect_all(const std::vector<bound_resource>& resources, const char* what) {
+        if (resources.empty())
+            return;
+        std::lock_guard lock(mutex_);
         for (const bound_resource& r : resources) {
             if (r.texture)
-                expect_texture(r.texture, r.range, r.want, what);
+                expect_texture_locked(r.texture, r.range, r.want, what);
             else if (r.buffer)
-                expect_buffer(r.buffer, r.want, what);
+                expect_buffer_locked(r.buffer, r.want, what);
         }
     }
 

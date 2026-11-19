@@ -37,7 +37,52 @@ namespace conduit {
             bind_layout_handle layout;
             std::vector<bind_group_entry> entries;
             std::vector<bind_layout_entry> layout_entries;
+            // what binding the group asks of each resource, worked out once since a group never changes
+            std::vector<state_validator::bound_resource> bound;
+            uint32_t dynamic_count = 0;
+            bool resolved = false;
         };
+        // what binding the group asks of each resource
+        void resolve_bound(const null_bind_group& g, std::vector<state_validator::bound_resource>& out) {
+            out.clear();
+            out.reserve(g.entries.size());
+            for (const bind_layout_entry& le : g.layout_entries) {
+                for (const bind_group_entry& e : g.entries) {
+                    if (e.binding != le.binding)
+                        continue;
+                    state_validator::bound_resource r;
+                    r.range = e.texture.range;
+                    switch (le.type) {
+                    case binding_type::sampled_texture:
+                        r.texture = e.texture.texture;
+                        r.want = state::shader_read | state::depth_read_sampled;
+                        break;
+                    case binding_type::storage_texture_rw:
+                        r.texture = e.texture.texture;
+                        r.want = state::shader_write;
+                        break;
+                    case binding_type::storage_buffer_rw:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::shader_write;
+                        break;
+                    case binding_type::storage_buffer:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::shader_read;
+                        break;
+                    case binding_type::uniform_buffer:
+                    case binding_type::uniform_buffer_dynamic:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::uniform_buffer;
+                        break;
+                    case binding_type::sampler:
+                        break;
+                    }
+                    if (r.texture || r.buffer)
+                        out.push_back(r);
+                }
+            }
+        }
+
         struct null_pipeline_layout {
             pipeline_layout_desc desc;
         };
@@ -236,6 +281,13 @@ namespace conduit {
                         report_device_error("CreateBindGroup: binding " + std::to_string(le.binding) +
                                             " is not fully populated");
                 }
+                for (const bind_layout_entry& le : g.layout_entries)
+                    if (le.type == binding_type::uniform_buffer_dynamic)
+                        g.dynamic_count++;
+                // a transient group is bound about once, so it works its resources out when bound instead
+                g.resolved = !desc.per_frame;
+                if (g.resolved)
+                    resolve_bound(g, g.bound);
                 stats_.live_bind_groups++;
                 return bind_groups_.alloc(std::move(g));
             }
@@ -654,49 +706,16 @@ namespace conduit {
                 error("SetBindGroup: unknown group or set index");
                 return;
             }
-            uint32_t dynamic_count = 0;
-            std::vector<state_validator::bound_resource> bound;
-            for (const bind_layout_entry& le : g->layout_entries) {
-                if (le.type == binding_type::uniform_buffer_dynamic)
-                    dynamic_count++;
-                for (const bind_group_entry& e : g->entries) {
-                    if (e.binding != le.binding)
-                        continue;
-                    state_validator::bound_resource r;
-                    r.range = e.texture.range;
-                    switch (le.type) {
-                    case binding_type::sampled_texture:
-                        r.texture = e.texture.texture;
-                        r.want = state::shader_read | state::depth_read_sampled;
-                        break;
-                    case binding_type::storage_texture_rw:
-                        r.texture = e.texture.texture;
-                        r.want = state::shader_write;
-                        break;
-                    case binding_type::storage_buffer_rw:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::shader_write;
-                        break;
-                    case binding_type::storage_buffer:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::shader_read;
-                        break;
-                    case binding_type::uniform_buffer:
-                    case binding_type::uniform_buffer_dynamic:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::uniform_buffer;
-                        break;
-                    case binding_type::sampler:
-                        break;
-                    }
-                    if (r.texture || r.buffer)
-                        bound.push_back(r);
-                }
-            }
-            if (dynamic_count != offsets.size())
-                error("SetBindGroup: expected " + std::to_string(dynamic_count) + " dynamic offsets, got " +
+            if (g->dynamic_count != offsets.size())
+                error("SetBindGroup: expected " + std::to_string(g->dynamic_count) + " dynamic offsets, got " +
                       std::to_string(offsets.size()));
-            device_.validator().expect_all(bound, "SetBindGroup");
+            if (g->resolved) {
+                device_.validator().expect_all(g->bound, "SetBindGroup");
+            } else {
+                thread_local std::vector<state_validator::bound_resource> scratch;
+                resolve_bound(*g, scratch);
+                device_.validator().expect_all(scratch, "SetBindGroup");
+            }
             bound_sets_[set] = group;
             device_.stats_.bind_group_binds++;
         }

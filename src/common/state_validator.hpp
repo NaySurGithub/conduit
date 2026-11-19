@@ -43,6 +43,8 @@ namespace conduit {
         };
 
         void report(std::string message);
+        void expect_texture_locked(texture_handle handle, const subresource_range& range, state want, const char* what);
+        void expect_buffer_locked(buffer_handle handle, state want, const char* what);
         static std::string state_name(state state);
         static uint32_t layer_count(const texture_desc& desc);
 
