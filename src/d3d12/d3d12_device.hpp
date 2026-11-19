@@ -311,7 +311,23 @@ namespace conduit::d3d12 {
         std::array<bind_group_handle, max_bind_groups> groups_{};
         std::array<std::array<uint32_t, max_dynamic_offsets>, max_bind_groups> dynamic_offsets_{};
         std::array<uint32_t, max_bind_groups> dynamic_counts_{};
+        // dirty_sets_: root arguments to send again; table_dirty_: of those, the ones whose descriptor tables
+        // changed too (a new group or root signature). a draw that only moves a dynamic offset sends just its CBV
         uint32_t dirty_sets_ = 0;
+        uint32_t table_dirty_ = 0;
+        // what a bound group puts in the root signature, taken when it is bound so a draw never looks it up
+        struct bound_tables {
+            D3D12_GPU_DESCRIPTOR_HANDLE table{};
+            D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
+            std::array<D3D12_GPU_VIRTUAL_ADDRESS, max_dynamic_offsets> dynamic_base{};
+            uint32_t dynamic_count = 0;
+        };
+        std::array<bound_tables, max_bind_groups> bound_tables_{};
+        const pipeline_layout_rec* layout_ = nullptr;
+        ID3D12CommandSignature* signature(bool dispatch, uint32_t stride);
+        ID3D12CommandSignature* last_signature_ = nullptr;
+        uint32_t last_signature_key_ = ~0u;
+        bool have_stencil_ref_ = false;
         std::array<uint32_t, max_push_constant_bytes / 4> push_{};
         uint32_t push_used_ = 0;
         bool push_dirty_ = false;

@@ -83,6 +83,10 @@ namespace conduit::d3d12 {
         dynamic_offsets_ = {};
         dynamic_counts_ = {};
         dirty_sets_ = 0;
+        table_dirty_ = 0;
+        bound_tables_ = {};
+        layout_ = nullptr;
+        have_stencil_ref_ = false;
         push_.fill(0);
         push_dirty_ = false;
         push_used_ = 0;
@@ -464,6 +468,7 @@ namespace conduit::d3d12 {
         for (uint32_t i = 0; i < max_bind_groups; i++)
             if (groups_[i])
                 dirty_sets_ |= 1u << i;
+        table_dirty_ = dirty_sets_;
         push_dirty_ = push_used_ != 0;
         vertex_dirty_ = vertex_mask_;
     }
@@ -539,6 +544,7 @@ namespace conduit::d3d12 {
         pipeline_.pso = pso;
         pipeline_.build.reset();
         layout_handle_ = p->layout_handle;
+        layout_ = device_.pipeline_layouts_.get(p->layout_handle);
         have_pipeline_ = true;
         pipeline_handle_ = handle;
         if (pso)
@@ -560,6 +566,7 @@ namespace conduit::d3d12 {
             for (uint32_t i = 0; i < max_bind_groups; i++)
                 if (groups_[i])
                     dirty_sets_ |= 1u << i;
+            table_dirty_ |= dirty_sets_;
             push_dirty_ = push_used_ != 0;
         }
         vertex_dirty_ = vertex_mask_;
@@ -581,6 +588,14 @@ namespace conduit::d3d12 {
         if (groups_[set] == group && dynamic_counts_[set] == count &&
             std::equal(offsets.begin(), offsets.begin() + count, dynamic_offsets_[set].begin()))
             return;
+        if (groups_[set] != group) {
+            bound_tables& t = bound_tables_[set];
+            t.table = device_.resource_heap_.gpu(g->table_offset);
+            t.samplers = device_.sampler_heap_.gpu(g->sampler_offset);
+            t.dynamic_base = g->dynamic_base;
+            t.dynamic_count = g->dynamic_count;
+            table_dirty_ |= 1u << set;
+        }
         groups_[set] = group;
         dynamic_counts_[set] = count;
         std::copy_n(offsets.begin(), count, dynamic_offsets_[set].begin());
@@ -654,8 +669,22 @@ namespace conduit::d3d12 {
     }
 
     void cmd_list::set_stencil_reference(uint32_t value) {
+        if (have_stencil_ref_ && !invalid_ && stencil_ref_ == value)
+            return;
         stencil_ref_ = value;
+        have_stencil_ref_ = true;
         list_->OMSetStencilRef(value);
+    }
+
+    // the device keeps every signature for its lifetime; a list remembers the last one so repeated indirect
+    // calls skip the device's lock and map lookup
+    ID3D12CommandSignature* cmd_list::signature(bool dispatch, uint32_t stride) {
+        const uint32_t key = dispatch ? 0x80000000u : stride;
+        if (last_signature_ && last_signature_key_ == key)
+            return last_signature_;
+        last_signature_ = device_.signature(dispatch, stride);
+        last_signature_key_ = key;
+        return last_signature_;
     }
 
     void cmd_list::invalidate_bound_state() {
@@ -665,6 +694,7 @@ namespace conduit::d3d12 {
         for (uint32_t i = 0; i < max_bind_groups; i++)
             if (groups_[i])
                 dirty_sets_ |= 1u << i;
+        table_dirty_ |= dirty_sets_;
         push_dirty_ = push_used_ != 0;
         vertex_dirty_ = vertex_mask_;
     }
@@ -711,7 +741,9 @@ namespace conduit::d3d12 {
 
         if (!dirty_sets_ && !push_dirty_)
             return;
-        pipeline_layout_rec* layout = device_.pipeline_layouts_.get(layout_handle_);
+        if (!layout_)
+            layout_ = device_.pipeline_layouts_.get(layout_handle_);
+        const pipeline_layout_rec* layout = layout_;
         if (!layout)
             return;
         if (dirty_sets_) {
@@ -720,30 +752,28 @@ namespace conduit::d3d12 {
                     continue;
                 if (!layout->sets[i])
                     continue;
-                bind_group_rec* g = device_.bind_groups_.get(groups_[i]);
-                if (!g) {
+                if (!groups_[i]) {
                     fail("draw with a destroyed or missing bind group at set " + std::to_string(i));
                     continue;
                 }
-                if (layout->table_param[i] >= 0) {
-                    const auto gpu = device_.resource_heap_.gpu(g->table_offset);
+                const bound_tables& g = bound_tables_[i];
+                if ((table_dirty_ & (1u << i)) && layout->table_param[i] >= 0) {
                     if (pipeline_.compute)
-                        list_->SetComputeRootDescriptorTable(layout->table_param[i], gpu);
+                        list_->SetComputeRootDescriptorTable(layout->table_param[i], g.table);
                     else
-                        list_->SetGraphicsRootDescriptorTable(layout->table_param[i], gpu);
+                        list_->SetGraphicsRootDescriptorTable(layout->table_param[i], g.table);
                 }
-                if (layout->sampler_param[i] >= 0) {
-                    const auto gpu = device_.sampler_heap_.gpu(g->sampler_offset);
+                if ((table_dirty_ & (1u << i)) && layout->sampler_param[i] >= 0) {
                     if (pipeline_.compute)
-                        list_->SetComputeRootDescriptorTable(layout->sampler_param[i], gpu);
+                        list_->SetComputeRootDescriptorTable(layout->sampler_param[i], g.samplers);
                     else
-                        list_->SetGraphicsRootDescriptorTable(layout->sampler_param[i], gpu);
+                        list_->SetGraphicsRootDescriptorTable(layout->sampler_param[i], g.samplers);
                 }
-                for (uint32_t k = 0; k < dynamic_counts_[i] && k < g->dynamic_count; k++) {
+                for (uint32_t k = 0; k < dynamic_counts_[i] && k < g.dynamic_count; k++) {
                     const int param = layout->dynamic_param[i][k];
                     if (param < 0)
                         continue;
-                    const D3D12_GPU_VIRTUAL_ADDRESS address = g->dynamic_base[k] + dynamic_offsets_[i][k];
+                    const D3D12_GPU_VIRTUAL_ADDRESS address = g.dynamic_base[k] + dynamic_offsets_[i][k];
                     if (pipeline_.compute)
                         list_->SetComputeRootConstantBufferView(param, address);
                     else
@@ -751,6 +781,7 @@ namespace conduit::d3d12 {
                 }
             }
             dirty_sets_ = 0;
+            table_dirty_ = 0;
         }
         if (push_dirty_ && layout->push_param >= 0) {
             const UINT words = layout->push_bytes / 4;
@@ -798,7 +829,7 @@ namespace conduit::d3d12 {
         }
         if (device_.use_validator_)
             device_.validator_.expect_buffer(args, state::indirect_argument, "DrawIndexedIndirect args");
-        ID3D12CommandSignature* sig = device_.signature(false, stride);
+        ID3D12CommandSignature* sig = signature(false, stride);
         if (!sig) {
             fail("DrawIndexedIndirect: command signature creation failed");
             return;
@@ -823,7 +854,7 @@ namespace conduit::d3d12 {
             device_.validator_.expect_buffer(args, state::indirect_argument, "DrawIndexedIndirectCount args");
             device_.validator_.expect_buffer(count_buffer, state::indirect_argument, "DrawIndexedIndirectCount count");
         }
-        ID3D12CommandSignature* sig = device_.signature(false, stride);
+        ID3D12CommandSignature* sig = signature(false, stride);
         if (!sig) {
             fail("DrawIndexedIndirectCount: command signature creation failed");
             return;
@@ -882,7 +913,7 @@ namespace conduit::d3d12 {
         }
         if (device_.use_validator_)
             device_.validator_.expect_buffer(args, state::indirect_argument, "DispatchIndirect args");
-        ID3D12CommandSignature* sig = device_.signature(true, 0);
+        ID3D12CommandSignature* sig = signature(true, 0);
         if (!sig) {
             fail("DispatchIndirect: command signature creation failed");
             return;

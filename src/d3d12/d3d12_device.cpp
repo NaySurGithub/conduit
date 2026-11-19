@@ -1329,7 +1329,8 @@ namespace conduit::d3d12 {
                                                    ? conduit::queue_type::graphics
                                                    : requested;
         queue_info& q = queues_[static_cast<size_t>(queue_type)];
-        std::vector<ID3D12CommandList*> native;
+        thread_local std::vector<ID3D12CommandList*> native;
+        native.clear();
         native.reserve(desc.lists.size());
         for (command_list* l : desc.lists) {
             auto* list = static_cast<cmd_list*>(l);
