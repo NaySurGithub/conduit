@@ -259,6 +259,10 @@ namespace conduit::vk {
         std::array<bind_group_handle, max_bind_groups> groups_{};
         std::array<std::array<uint32_t, max_dynamic_offsets>, max_bind_groups> dynamic_offsets_{};
         std::array<uint32_t, max_bind_groups> dynamic_counts_{};
+        // the native set behind each bound group and which sets the bound layout uses, taken when they are
+        // bound so a draw never looks a group or layout up again
+        std::array<VkDescriptorSet, max_bind_groups> native_sets_{};
+        uint32_t layout_sets_ = 0xFu;
         uint32_t dirty_sets_ = 0;
         std::array<uint8_t, max_push_constant_bytes> push_{};
         bool push_dirty_ = false;
@@ -280,6 +284,7 @@ namespace conduit::vk {
         VkDeviceSize ioffset_ = 0;
         VkIndexType itype_ = VK_INDEX_TYPE_UINT32;
         uint32_t stencil_ref_ = 0;
+        bool have_stencil_ref_ = false;
     };
 
     struct thread_pools {
@@ -451,6 +456,17 @@ namespace conduit::vk {
         std::vector<std::pair<render_pass_key, VkRenderPass>> render_passes_;
         std::mutex framebuffer_mutex_;
         std::vector<std::vector<VkFramebuffer>> slot_framebuffers_;
+        // render-pass targets repeat every frame: their framebuffers are kept instead of made per pass
+        struct cached_framebuffer {
+            VkRenderPass pass = VK_NULL_HANDLE;
+            std::array<VkImageView, max_color_targets + 1> views{};
+            uint32_t count = 0, width = 0, height = 0;
+            VkFramebuffer framebuffer = VK_NULL_HANDLE;
+            uint64_t used = 0;
+        };
+        std::vector<cached_framebuffer> framebuffer_cache_;
+        // drops every kept framebuffer that uses one of these views, before the views go away
+        void forget_framebuffers(const std::vector<VkImageView>& views);
 
         std::mutex view_mutex_;
         std::mutex sampler_mutex_;
@@ -475,6 +491,12 @@ namespace conduit::vk {
 
         std::mutex pools_mutex_;
         std::unordered_map<std::thread::id, std::unique_ptr<thread_pools>> thread_pools_;
+        // tells a thread's cached pools apart from those of an earlier device at the same address
+        const uint64_t instance_id_ = next_instance_id();
+        static uint64_t next_instance_id() {
+            static std::atomic<uint64_t> next{1};
+            return next.fetch_add(1, std::memory_order_relaxed);
+        }
 
         struct pipeline_job;
         void run_pipeline_job(pipeline_job& job);

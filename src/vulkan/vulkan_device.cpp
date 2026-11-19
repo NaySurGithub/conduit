@@ -80,6 +80,9 @@ namespace conduit::vk {
         for (auto& list : slot_framebuffers_)
             for (VkFramebuffer f : list)
                 fn_.vkDestroyFramebuffer(device_, f, nullptr);
+        for (const cached_framebuffer& c : framebuffer_cache_)
+            fn_.vkDestroyFramebuffer(device_, c.framebuffer, nullptr);
+        framebuffer_cache_.clear();
         for (VkFence f : all_fences_)
             fn_.vkDestroyFence(device_, f, nullptr);
         if (empty_set_layout_)
@@ -883,6 +886,12 @@ namespace conduit::vk {
             return;
         if (use_validator_)
             validator_.on_destroy(h);
+        if (!dynamic_rendering_) {
+            std::vector<VkImageView> views;
+            for (auto& [key, view] : rec.views)
+                views.push_back(view);
+            forget_framebuffers(views);
+        }
         for (auto& [key, view] : rec.views)
             fn_.vkDestroyImageView(device_, view, nullptr);
     }
@@ -1607,6 +1616,12 @@ namespace conduit::vk {
         if (use_validator_)
             validator_.on_destroy(h);
         retire([this, rec = std::move(rec)] {
+            if (!dynamic_rendering_) {
+                std::vector<VkImageView> views;
+                for (auto& [key, view] : rec.views)
+                    views.push_back(view);
+                forget_framebuffers(views);
+            }
             for (auto& [key, view] : rec.views)
                 fn_.vkDestroyImageView(device_, view, nullptr);
             if (!rec.external)
@@ -1740,12 +1755,19 @@ namespace conduit::vk {
     }
 
     thread_pools& device::pools_for_this_thread() {
+        // every acquire used to take the lock and hash the thread id; a thread keeps its answer per device
+        thread_local uint64_t cached_device = 0;
+        thread_local thread_pools* cached_pools = nullptr;
+        if (cached_device == instance_id_ && cached_pools)
+            return *cached_pools;
         std::lock_guard lock(pools_mutex_);
         auto& entry = thread_pools_[std::this_thread::get_id()];
         if (!entry) {
             entry = std::make_unique<thread_pools>();
             entry->slots.resize(options_.frames_in_flight);
         }
+        cached_device = instance_id_;
+        cached_pools = entry.get();
         return *entry;
     }
 
@@ -2220,9 +2242,33 @@ namespace conduit::vk {
         return pass;
     }
 
-    // framebuffers live for the frame slot that recorded them
+    void device::forget_framebuffers(const std::vector<VkImageView>& views) {
+        if (views.empty())
+            return;
+        std::lock_guard lock(framebuffer_mutex_);
+        std::erase_if(framebuffer_cache_, [&](const cached_framebuffer& c) {
+            for (uint32_t i = 0; i < c.count; i++)
+                if (std::find(views.begin(), views.end(), c.views[i]) != views.end()) {
+                    fn_.vkDestroyFramebuffer(device_, c.framebuffer, nullptr);
+                    return true;
+                }
+            return false;
+        });
+    }
+
+    // kept across frames by attachments; one pushed out of the cache lives on until its frame slot comes round
     VkFramebuffer device::make_framebuffer(VkRenderPass pass, const VkImageView* views, uint32_t count, uint32_t width,
                                            uint32_t height) {
+        constexpr size_t kKept = 64;
+        {
+            std::lock_guard lock(framebuffer_mutex_);
+            for (cached_framebuffer& c : framebuffer_cache_)
+                if (c.pass == pass && c.count == count && c.width == width && c.height == height &&
+                    std::equal(views, views + count, c.views.begin())) {
+                    c.used = frame_;
+                    return c.framebuffer;
+                }
+        }
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         fi.renderPass = pass;
         fi.attachmentCount = count;
@@ -2236,7 +2282,26 @@ namespace conduit::vk {
             return VK_NULL_HANDLE;
         }
         std::lock_guard lock(framebuffer_mutex_);
-        slot_framebuffers_[slot_].push_back(fb);
+        if (count > max_color_targets + 1) {
+            slot_framebuffers_[slot_].push_back(fb);
+            return fb;
+        }
+        if (framebuffer_cache_.size() >= kKept) {
+            auto oldest = std::min_element(
+                framebuffer_cache_.begin(), framebuffer_cache_.end(),
+                [](const cached_framebuffer& a, const cached_framebuffer& b) { return a.used < b.used; });
+            slot_framebuffers_[slot_].push_back(oldest->framebuffer);
+            framebuffer_cache_.erase(oldest);
+        }
+        cached_framebuffer c;
+        c.pass = pass;
+        std::copy_n(views, count, c.views.begin());
+        c.count = count;
+        c.width = width;
+        c.height = height;
+        c.framebuffer = fb;
+        c.used = frame_;
+        framebuffer_cache_.push_back(c);
         return fb;
     }
 

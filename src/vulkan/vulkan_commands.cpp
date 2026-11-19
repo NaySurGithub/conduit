@@ -40,6 +40,8 @@ namespace conduit::vk {
         groups_ = {};
         dynamic_offsets_ = {};
         dynamic_counts_ = {};
+        native_sets_ = {};
+        layout_sets_ = 0xFu;
         dirty_sets_ = 0;
         push_.fill(0);
         push_dirty_ = false;
@@ -55,6 +57,7 @@ namespace conduit::vk {
         voffsets_.fill(0);
         ibuffer_ = VK_NULL_HANDLE;
         stencil_ref_ = 0;
+        have_stencil_ref_ = false;
         open_labels_ = 0;
         counters_ = {};
 
@@ -511,6 +514,8 @@ namespace conduit::vk {
     }
 
     void cmd_list::set_pipeline(pipeline_handle handle) {
+        if (have_pipeline_ && !invalid_ && pipeline_handle_ == handle && pipeline_.compute != in_rendering_)
+            return;
         pipeline_rec* p = device_.pipelines_.get(handle);
         if (!p) {
             fail("SetPipeline: unknown pipeline");
@@ -535,6 +540,13 @@ namespace conduit::vk {
                 if (groups_[i])
                     dirty_sets_ |= 1u << i;
             push_dirty_ = push_used_ != 0;
+            layout_sets_ = 0xFu;
+            if (const pipeline_layout_rec* layout = device_.pipeline_layouts_.get(p->layout_handle)) {
+                layout_sets_ = 0;
+                for (uint32_t i = 0; i < max_bind_groups; i++)
+                    if (layout->sets[i])
+                        layout_sets_ |= 1u << i;
+            }
         }
         pipeline_.pipeline = native;
         pipeline_.bind_point = p->bind_point;
@@ -569,6 +581,7 @@ namespace conduit::vk {
             std::equal(offsets.begin(), offsets.begin() + count, dynamic_offsets_[set].begin()))
             return;
         groups_[set] = group;
+        native_sets_[set] = g->set;
         dynamic_counts_[set] = count;
         std::copy_n(offsets.begin(), count, dynamic_offsets_[set].begin());
         dirty_sets_ |= 1u << set;
@@ -639,7 +652,10 @@ namespace conduit::vk {
     }
 
     void cmd_list::set_stencil_reference(uint32_t value) {
+        if (have_stencil_ref_ && !invalid_ && stencil_ref_ == value)
+            return;
         stencil_ref_ = value;
+        have_stencil_ref_ = true;
         device_.fn_.vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, value);
     }
 
@@ -672,7 +688,6 @@ namespace conduit::vk {
         if (!have_pipeline_)
             return;
         if (dirty_sets_) {
-            pipeline_layout_rec* layout = device_.pipeline_layouts_.get(pipeline_.layout_handle);
             std::array<VkDescriptorSet, max_bind_groups> sets{};
             std::array<uint32_t, max_bind_groups * max_dynamic_offsets> offsets{};
             uint32_t first = 0, set_count = 0, offset_count = 0;
@@ -683,19 +698,19 @@ namespace conduit::vk {
                 set_count = offset_count = 0;
             };
             for (uint32_t i = 0; i < max_bind_groups; i++) {
-                bind_group_rec* g = nullptr;
-                if ((dirty_sets_ & (1u << i)) && (!layout || layout->sets[i])) {
-                    g = device_.bind_groups_.get(groups_[i]);
-                    if (!g)
+                VkDescriptorSet native = VK_NULL_HANDLE;
+                if ((dirty_sets_ & layout_sets_ & (1u << i))) {
+                    native = groups_[i] ? native_sets_[i] : VK_NULL_HANDLE;
+                    if (!native)
                         fail("draw with a destroyed or missing bind group at set " + std::to_string(i));
                 }
-                if (!g) {
+                if (!native) {
                     flush_run();
                     continue;
                 }
                 if (!set_count)
                     first = i;
-                sets[set_count++] = g->set;
+                sets[set_count++] = native;
                 std::copy_n(dynamic_offsets_[i].begin(), dynamic_counts_[i], offsets.begin() + offset_count);
                 offset_count += dynamic_counts_[i];
             }
