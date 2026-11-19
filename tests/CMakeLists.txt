@@ -39,6 +39,10 @@ conduit_test(shader_library_test)
 add_dependencies(shader_library_test conduit_test_pack)
 add_test(NAME shader_library_test COMMAND shader_library_test "${pack}")
 
+conduit_test(encode_bench)
+add_dependencies(encode_bench conduit_test_pack)
+add_test(NAME encode_bench COMMAND encode_bench "${pack}" --draws 4000 --frames 40)
+
 conduit_test(pipeline_smoke)
 add_dependencies(pipeline_smoke conduit_test_pack)
 foreach(api VULKAN D3D12)
