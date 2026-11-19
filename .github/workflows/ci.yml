@@ -53,6 +53,17 @@ jobs:
             *.tar.gz) tar -xzf "deps/$archive" -C deps/slang ;;
             *) unzip -q "deps/$archive" -d deps/slang ;;
           esac
+      - name: Fetch dxc
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R microsoft/DirectXShaderCompiler --pattern 'dxc_*.zip' -D deps/dxc-zip
+          mkdir -p deps/dxc/lib
+          for z in deps/dxc-zip/*.zip; do 7z x -y "$z" -odeps/dxc-zip/x > /dev/null; done
+          cp deps/dxc-zip/x/bin/x64/*.dll deps/dxc/lib/
+          ls deps/dxc/lib
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DCONDUIT_DEPS_DIR=${{ github.workspace }}/deps -DCONDUIT_WARNINGS_AS_ERRORS=ON
       - name: Build
@@ -60,6 +71,10 @@ jobs:
       - name: Test
         if: matrix.test
         run: ctest --preset ${{ matrix.preset }}
+      - name: Bench
+        if: matrix.test
+        shell: bash
+        run: for i in 1 2 3; do ctest --preset ${{ matrix.preset }} -R encode_bench -V | grep -E "ns/draw|unavailable"; done
 
   lint:
     runs-on: ubuntu-24.04
