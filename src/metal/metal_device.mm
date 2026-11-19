@@ -310,6 +310,28 @@ namespace conduit::metal {
         bind_group g;
         g.layout = desc.layout;
         g.entries.assign(desc.entries.begin(), desc.entries.end());
+        g.indexed = !desc.per_frame && g.entries.size() <= 127;
+        if (g.indexed)
+            g.index_of.fill(-1);
+        for (size_t i = 0; g.indexed && i < g.entries.size(); i++) {
+            const bind_group_entry& e = g.entries[i];
+            if (e.array_index == 0 && e.binding < g.index_of.size() && g.index_of[e.binding] < 0)
+                g.index_of[e.binding] = static_cast<int8_t>(i);
+        }
+        for (size_t i = 0; i < g.entries.size(); i++) {
+            const bind_group_entry& e = g.entries[i];
+            if (!e.texture.texture)
+                continue;
+            // a transient group is bound about once, so resolving its views up front would only add to its cost
+            if (texture* t = desc.per_frame ? nullptr : textures_.get(e.texture.texture)) {
+                if (g.views.empty())
+                    g.views.resize(g.entries.size());
+                bind_group::resolved_view& v = g.views[i];
+                v.epoch = t->epoch.load(std::memory_order_acquire);
+                v.dim = e.texture.view_dim;
+                v.view = view_of(*t, e.texture.range, e.texture.view_dim, e.texture.format, e.texture.stencil);
+            }
+        }
         stats_.live_bind_groups++;
         return bind_groups_.alloc(std::move(g));
     }
@@ -454,6 +476,7 @@ namespace conduit::metal {
         std::lock_guard lock(view_mutex_);
         t->views.clear();
         t->native = texture;
+        t->epoch.fetch_add(1, std::memory_order_release);
     }
 
     void device::resize_surface_texture(texture_handle handle, uint32_t width, uint32_t height) {

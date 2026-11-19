@@ -56,6 +56,21 @@ namespace conduit::metal {
         texture_desc desc;
         std::string name;
         bool external = false;
+        // bumped when a swapchain image swaps its native texture, so views cached elsewhere know to look again
+        std::atomic<uint32_t> epoch{0};
+        texture() = default;
+        texture(texture&& o) noexcept
+            : native(o.native), desc(o.desc), name(std::move(o.name)), external(o.external),
+              epoch(o.epoch.load(std::memory_order_relaxed)), views(std::move(o.views)) {}
+        texture& operator=(texture&& o) noexcept {
+            native = o.native;
+            desc = o.desc;
+            name = std::move(o.name);
+            external = o.external;
+            epoch.store(o.epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            views = std::move(o.views);
+            return *this;
+        }
         std::map<view_key, id<MTLTexture>> views;
     };
 
@@ -79,6 +94,25 @@ namespace conduit::metal {
     struct bind_group {
         bind_layout_handle layout;
         std::vector<bind_group_entry> entries;
+        // binding number -> entry for the low bindings every layout uses, so binding a group rarely searches it
+        std::array<int8_t, 32> index_of;
+        bool indexed = false;
+        // texture views resolved when the group is made. not retained: they are the texture's own or live in its
+        // view cache, and a bind only trusts one while the texture is alive and its epoch still matches
+        struct resolved_view {
+            __unsafe_unretained id<MTLTexture> view = nil;
+            uint32_t epoch = 0;
+            texture_dim dim = texture_dim::tex2d;
+        };
+        std::vector<resolved_view> views;
+        const bind_group_entry* find(uint32_t binding) const {
+            if (indexed && binding < index_of.size())
+                return index_of[binding] >= 0 ? &entries[static_cast<size_t>(index_of[binding])] : nullptr;
+            for (const bind_group_entry& e : entries)
+                if (e.binding == binding && e.array_index == 0)
+                    return &e;
+            return nullptr;
+        }
     };
 
     struct pipeline_layout {
@@ -209,15 +243,43 @@ namespace conduit::metal {
             dirty_sets_ = 0xF;
             pipeline_dirty_ = true;
             vertex_dirty_ = 0xFF;
+            reset_bound();
         }
 
     private:
         void end_encoder();
         id<MTLBlitCommandEncoder> blit();
         id<MTLComputeCommandEncoder> compute();
-        bool prepare_draw();
+        const pipeline* prepare_draw();
         bool bind_sets(const pipeline& p);
         void apply_pipeline_state(const pipeline& p, id<MTLRenderPipelineState> state);
+        void reset_bound();
+        void bind_buffer(uint32_t stage, uint32_t index, id<MTLBuffer> buffer, uint64_t offset);
+        void bind_texture(uint32_t stage, uint32_t index, id<MTLTexture> texture);
+        void bind_sampler(uint32_t stage, uint32_t index, id<MTLSamplerState> sampler);
+
+        // what the open encoder already has, per stage: identical binds are dropped and a moved offset on the
+        // same buffer goes through the cheap set*BufferOffset path. compared by identity only, never retained
+        static constexpr uint32_t cached_buffers = 31, cached_textures = 32, cached_samplers = 16;
+        struct stage_bound {
+            std::array<__unsafe_unretained id<MTLBuffer>, cached_buffers> buffers{};
+            std::array<uint64_t, cached_buffers> offsets{};
+            std::array<__unsafe_unretained id<MTLTexture>, cached_textures> textures{};
+            std::array<__unsafe_unretained id<MTLSamplerState>, cached_samplers> samplers{};
+        };
+        std::array<stage_bound, 3> bound_{};
+        struct render_bound {
+            __unsafe_unretained id<MTLRenderPipelineState> state = nil;
+            __unsafe_unretained id<MTLDepthStencilState> depth_stencil = nil;
+            MTLCullMode cull = MTLCullModeNone;
+            MTLWinding winding = MTLWindingClockwise;
+            MTLTriangleFillMode fill = MTLTriangleFillModeFill;
+            MTLDepthClipMode clip = MTLDepthClipModeClip;
+            float bias[3] = {0, 0, 0};
+            uint32_t stencil_ref = 0;
+            bool fresh = true;
+        } render_bound_;
+        __unsafe_unretained id<MTLComputePipelineState> compute_bound_ = nil;
 
         device& device_;
         queue_type queue_;
@@ -234,6 +296,22 @@ namespace conduit::metal {
         };
         std::array<bound_set, max_bind_groups> sets_{};
         uint32_t dirty_sets_ = 0;
+        // sets rebound with the same group and only new dynamic offsets: the buffers the last full bind
+        // resolved for that pipeline and group are moved in place instead of resolving the group again
+        uint32_t offsets_dirty_ = 0;
+        struct dynamic_slot {
+            uint8_t stage = 0, index = 0, dynamic = 0;
+            __unsafe_unretained id<MTLBuffer> buffer = nil;
+            uint64_t base = 0;
+        };
+        struct resolved_set {
+            pipeline_handle pipeline;
+            bind_group_handle group;
+            bool valid = false;
+            uint32_t count = 0;
+            std::array<dynamic_slot, 8> slots{};
+        };
+        std::array<resolved_set, max_bind_groups> resolved_{};
         bool pipeline_dirty_ = true;
         struct vertex_slot {
             buffer_handle buffer;
