@@ -1111,9 +1111,14 @@ namespace conduit::vk {
             return {};
         }
 
-        std::vector<VkWriteDescriptorSet> writes;
-        std::vector<VkDescriptorBufferInfo> buffer_infos;
-        std::vector<VkDescriptorImageInfo> image_infos;
+        // reused per thread so making a group allocates nothing here; reserved up front because the writes point
+        // into the info arrays
+        thread_local std::vector<VkWriteDescriptorSet> writes;
+        thread_local std::vector<VkDescriptorBufferInfo> buffer_infos;
+        thread_local std::vector<VkDescriptorImageInfo> image_infos;
+        writes.clear();
+        buffer_infos.clear();
+        image_infos.clear();
         writes.reserve(desc.entries.size());
         buffer_infos.reserve(desc.entries.size());
         image_infos.reserve(desc.entries.size());
