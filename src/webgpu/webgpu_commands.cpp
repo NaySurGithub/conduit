@@ -277,6 +277,9 @@ namespace conduit::webgpu {
     }
 
     void webgpu_command_list::set_pipeline(pipeline_handle p) {
+        // the same pipeline again keeps every group it already has bound
+        if (p == pipeline_ && !pipeline_dirty_)
+            return;
         pipeline_ = p;
         pipeline_dirty_ = true;
         dirty_sets_ = 0xF;
@@ -476,10 +479,17 @@ namespace conduit::webgpu {
     }
 
     void webgpu_command_list::dispatch(uint32_t x, uint32_t y, uint32_t z) {
+        if (!prepare_dispatch())
+            return;
+        wgpuComputePassEncoderDispatchWorkgroups(compute_.get(), x, y, z);
+        device_.mutable_stats().dispatches++;
+    }
+
+    bool webgpu_command_list::prepare_dispatch() {
         const pipeline* p = device_.pipelines_.get(pipeline_);
         if (!p || !p->compute || !p->comp) {
             device_.report_error("Dispatch without a compute pipeline");
-            return;
+            return false;
         }
         if (!compute_) {
             end_pass();
@@ -504,13 +514,12 @@ namespace conduit::webgpu {
                         ns->dynamic_pick[i] < sets_[s].offset_count ? sets_[s].offsets[ns->dynamic_pick[i]] : 0;
             if (!group) {
                 device_.report_error("Dispatch: set " + std::to_string(s) + " is not bound");
-                return;
+                return false;
             }
             wgpuComputePassEncoderSetBindGroup(compute_.get(), s, group, picked_count, picked.data());
         }
         dirty_sets_ = 0;
-        wgpuComputePassEncoderDispatchWorkgroups(compute_.get(), x, y, z);
-        device_.mutable_stats().dispatches++;
+        return true;
     }
 
     void webgpu_command_list::dispatch_indirect(buffer_handle args, uint64_t offset) {
@@ -519,9 +528,11 @@ namespace conduit::webgpu {
             device_.report_error("DispatchIndirect: bad buffer");
             return;
         }
-        dispatch(0, 0, 0);
-        if (compute_)
-            wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute_.get(), a->native.get(), offset);
+        // binds like dispatch does, without the empty direct dispatch it used to record first
+        if (!prepare_dispatch())
+            return;
+        wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute_.get(), a->native.get(), offset);
+        device_.mutable_stats().dispatches++;
     }
 
     void webgpu_command_list::write_timestamp(query_set_handle, uint32_t) {}

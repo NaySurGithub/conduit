@@ -280,6 +280,7 @@ namespace conduit::webgpu {
                                          uint64_t count_offset, uint32_t max_draws, uint32_t stride) override;
         void dispatch(uint32_t x, uint32_t y, uint32_t z) override;
         void dispatch_indirect(buffer_handle args, uint64_t offset) override;
+        bool prepare_dispatch();
         void write_timestamp(query_set_handle set, uint32_t index) override;
         void resolve_queries(query_set_handle set, uint32_t first, uint32_t count, buffer_handle dst,
                              uint64_t dst_offset) override;
