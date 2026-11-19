@@ -165,6 +165,8 @@ namespace conduit::gles {
     // ---------------------------------------------------------------- recording
 
     void cmd_list::begin() {
+        if (stream_.capacity() == 0)
+            stream_ = device_.take_stream();
         stream_.clear();
         counters_ = {};
     }

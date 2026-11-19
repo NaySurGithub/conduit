@@ -830,9 +830,11 @@ namespace conduit::gles {
         counters_.count_submit();
         std::vector<fence_op> waits(desc.waits.begin(), desc.waits.end());
         std::vector<fence_op> signals(desc.signals.begin(), desc.signals.end());
-        thread_.post([this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)] {
-            execute(streams, waits, signals);
-        });
+        thread_.post(
+            [this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)]() mutable {
+                execute(streams, waits, signals);
+                recycle_streams(streams);
+            });
     }
 
     void device::execute(const std::vector<std::vector<uint8_t>>& streams, const std::vector<fence_op>& waits,

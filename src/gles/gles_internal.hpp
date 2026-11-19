@@ -367,15 +367,18 @@ namespace conduit::gles {
         };
 
         // header, the payload, then `extra_bytes` of variable length data
+        // appended as is: growing with resize would zero every byte just before it is overwritten
         template <class T>
         void emit(uint16_t op, const T& payload, const void* extra = nullptr, size_t extra_bytes = 0) {
             const stream_header header{op, 0, static_cast<uint32_t>(extra_bytes)};
-            const size_t at = stream_.size();
-            stream_.resize(at + sizeof(header) + sizeof(T) + extra_bytes);
-            std::memcpy(stream_.data() + at, &header, sizeof(header));
-            std::memcpy(stream_.data() + at + sizeof(header), &payload, sizeof(T));
-            if (extra_bytes)
-                std::memcpy(stream_.data() + at + sizeof(header) + sizeof(T), extra, extra_bytes);
+            const auto* h = reinterpret_cast<const uint8_t*>(&header);
+            const auto* p = reinterpret_cast<const uint8_t*>(&payload);
+            stream_.insert(stream_.end(), h, h + sizeof(header));
+            stream_.insert(stream_.end(), p, p + sizeof(T));
+            if (extra_bytes) {
+                const auto* e = static_cast<const uint8_t*>(extra);
+                stream_.insert(stream_.end(), e, e + extra_bytes);
+            }
         }
         void emit_op(uint16_t op) { emit(op, no_payload{}); }
 
@@ -596,6 +599,29 @@ namespace conduit::gles {
         std::mutex fence_mutex_;
         std::condition_variable fence_cv_;
         std::mutex list_mutex_;
+        // replayed streams come back here with their capacity, so a list does not regrow its stream every frame
+        std::mutex stream_pool_mutex_;
+        std::vector<std::vector<uint8_t>> stream_pool_;
+
+    public:
+        std::vector<uint8_t> take_stream() {
+            std::lock_guard lock(stream_pool_mutex_);
+            if (stream_pool_.empty())
+                return {};
+            std::vector<uint8_t> out = std::move(stream_pool_.back());
+            stream_pool_.pop_back();
+            return out;
+        }
+        void recycle_streams(std::vector<std::vector<uint8_t>>& streams) {
+            std::lock_guard lock(stream_pool_mutex_);
+            for (auto& s : streams)
+                if (stream_pool_.size() < 32) {
+                    s.clear();
+                    stream_pool_.push_back(std::move(s));
+                }
+        }
+
+    private:
         std::vector<std::unique_ptr<cmd_list>> lists_;
         std::vector<cmd_list*> free_lists_;
         std::mutex error_mutex_;
