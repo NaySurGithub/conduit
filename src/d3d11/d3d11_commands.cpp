@@ -1,6 +1,7 @@
 #include "d3d11/d3d11_internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace conduit::d3d11 {
@@ -40,6 +41,9 @@ namespace conduit::d3d11 {
         pass_width_ = pass_height_ = 0;
         bound_srvs_ = {};
         bound_uavs_ = 0;
+        offsets_dirty_ = 0;
+        resolved_ = {};
+        reset_bound();
         resolves_.clear();
         for (auto& stage_mirrors : upload_mirrors_)
             for (upload_mirror& m : stage_mirrors)
@@ -219,6 +223,100 @@ namespace conduit::d3d11 {
             ctx_->CSSetUnorderedAccessViews(0, (std::min)(bound_uavs_, 8u), null_uavs, nullptr);
         bound_srvs_ = {};
         bound_uavs_ = 0;
+        for (stage_bound& b : bound_)
+            b.srvs = {};
+    }
+
+    void cmd_list::reset_bound() {
+        bound_ = {};
+        state_bound_ = {};
+    }
+
+    void cmd_list::bind_constant(uint32_t stage, uint32_t slot, ID3D11Buffer* cb, bool offset_call, UINT first,
+                                 UINT constants) {
+        if (!offset_call) {
+            first = 0;
+            constants = ~0u;
+        }
+        if (slot < cached_constants) {
+            stage_bound& b = bound_[stage];
+            if (b.constants[slot] == cb && b.first[slot] == first && b.count[slot] == constants)
+                return;
+            b.constants[slot] = cb;
+            b.first[slot] = first;
+            b.count[slot] = constants;
+        }
+        switch (stage) {
+        case stage_vertex:
+            if (offset_call)
+                ctx1_->VSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->VSSetConstantBuffers(slot, 1, &cb);
+            break;
+        case stage_pixel:
+            if (offset_call)
+                ctx1_->PSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->PSSetConstantBuffers(slot, 1, &cb);
+            break;
+        default:
+            if (offset_call)
+                ctx1_->CSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->CSSetConstantBuffers(slot, 1, &cb);
+            break;
+        }
+    }
+
+    void cmd_list::bind_srv(uint32_t stage, uint32_t slot, ID3D11ShaderResourceView* srv) {
+        if (slot < cached_srvs) {
+            if (bound_[stage].srvs[slot] == srv)
+                return;
+            bound_[stage].srvs[slot] = srv;
+        }
+        if (stage == stage_vertex)
+            ctx_->VSSetShaderResources(slot, 1, &srv);
+        else if (stage == stage_pixel)
+            ctx_->PSSetShaderResources(slot, 1, &srv);
+        else
+            ctx_->CSSetShaderResources(slot, 1, &srv);
+    }
+
+    void cmd_list::bind_sampler(uint32_t stage, uint32_t slot, ID3D11SamplerState* state) {
+        if (slot < cached_samplers) {
+            if (bound_[stage].samplers[slot] == state)
+                return;
+            bound_[stage].samplers[slot] = state;
+        }
+        if (stage == stage_vertex)
+            ctx_->VSSetSamplers(slot, 1, &state);
+        else if (stage == stage_pixel)
+            ctx_->PSSetSamplers(slot, 1, &state);
+        else
+            ctx_->CSSetSamplers(slot, 1, &state);
+    }
+
+    void cmd_list::apply_pipeline(const pipeline& p) {
+        state_bound& b = state_bound_;
+        const bool all = b.fresh;
+        if (all || b.input_layout != p.input_layout.get())
+            ctx_->IASetInputLayout(b.input_layout = p.input_layout.get());
+        if (all || b.topology != p.topology)
+            ctx_->IASetPrimitiveTopology(b.topology = p.topology);
+        if (all || b.vs != p.vs.get())
+            ctx_->VSSetShader(b.vs = p.vs.get(), nullptr, 0);
+        if (all || b.ps != p.ps.get())
+            ctx_->PSSetShader(b.ps = p.ps.get(), nullptr, 0);
+        if (all || b.raster != p.raster.get())
+            ctx_->RSSetState(b.raster = p.raster.get());
+        if (all || b.blend != p.blend.get())
+            ctx_->OMSetBlendState(b.blend = p.blend.get(), nullptr, 0xFFFFFFFFu);
+        if (all || b.depth_stencil != p.depth_stencil.get() || b.stencil_ref != stencil_ref_) {
+            b.depth_stencil = p.depth_stencil.get();
+            b.stencil_ref = stencil_ref_;
+            ctx_->OMSetDepthStencilState(b.depth_stencil, stencil_ref_);
+        }
+        b.fresh = false;
     }
 
     void cmd_list::begin_rendering(const rendering_desc& desc) {
@@ -294,6 +392,8 @@ namespace conduit::d3d11 {
     }
 
     void cmd_list::set_pipeline(pipeline_handle p) {
+        if (p == pipeline_)
+            return;
         pipeline_ = p;
         pipeline_dirty_ = true;
         dirty_sets_ = 0xF;
@@ -304,12 +404,22 @@ namespace conduit::d3d11 {
         if (set >= max_bind_groups)
             return;
         bound_set& s = sets_[set];
-        s.group = group;
-        s.offset_count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
-        for (uint32_t i = 0; i < s.offset_count; i++)
-            s.offsets[i] = dynamic_offsets[i];
-        dirty_sets_ |= 1u << set;
+        const uint32_t bit = 1u << set;
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
         device_.mutable_stats().bind_group_binds++;
+        if (s.group == group && !(dirty_sets_ & bit)) {
+            if (count == s.offset_count &&
+                std::equal(dynamic_offsets.begin(), dynamic_offsets.begin() + count, s.offsets.begin()))
+                return;
+            s.offset_count = count;
+            std::copy_n(dynamic_offsets.begin(), count, s.offsets.begin());
+            offsets_dirty_ |= bit;
+            return;
+        }
+        s.group = group;
+        s.offset_count = count;
+        std::copy_n(dynamic_offsets.begin(), count, s.offsets.begin());
+        dirty_sets_ |= bit;
     }
 
     void cmd_list::push_constants(const void*, uint32_t, uint32_t) {
@@ -369,18 +479,49 @@ namespace conduit::d3d11 {
 
     void cmd_list::set_stencil_reference(uint32_t value) {
         stencil_ref_ = value;
-        if (const pipeline* p = device_.pipelines_.get(pipeline_); p && !p->compute && in_pass_)
-            ctx_->OMSetDepthStencilState(p->depth_stencil.get(), stencil_ref_);
+        if (const pipeline* p = device_.pipelines_.get(pipeline_);
+            p && !p->compute && in_pass_ && !pipeline_dirty_ && state_bound_.stencil_ref != value) {
+            state_bound_.depth_stencil = p->depth_stencil.get();
+            state_bound_.stencil_ref = value;
+            ctx_->OMSetDepthStencilState(state_bound_.depth_stencil, value);
+        }
     }
 
     bool cmd_list::bind_sets(const pipeline& p) {
         const uint32_t first = p.compute ? stage_compute : stage_vertex;
         const uint32_t last = p.compute ? stage_compute : stage_pixel;
+        for (uint32_t moved = offsets_dirty_ & ~dirty_sets_; moved;) {
+            const uint32_t s = static_cast<uint32_t>(std::countr_zero(moved));
+            moved &= moved - 1;
+            const bound_set& bs = sets_[s];
+            const resolved_set& r = resolved_[s];
+            bool fast = r.valid && r.pipeline == pipeline_ && r.group == bs.group;
+            for (uint32_t i = 0; fast && i < r.count; i++) {
+                const dynamic_constant& d = r.constants[i];
+                const uint64_t offset = d.base + (d.dynamic < bs.offset_count ? bs.offsets[d.dynamic] : 0);
+                if ((offset & 255) != 0 || offset >= d.gpu_size) {
+                    fast = false;
+                    break;
+                }
+                const uint64_t size = d.size ? d.size : d.gpu_size - offset;
+                const uint64_t span = std::min<uint64_t>(align_up(size, 256), d.gpu_size - offset);
+                bind_constant(d.stage, d.slot, d.buffer, true, static_cast<UINT>(offset / 16),
+                              static_cast<UINT>(std::min<uint64_t>(span, constant_window) / 16));
+            }
+            if (!fast)
+                dirty_sets_ |= 1u << s;
+        }
+        offsets_dirty_ = 0;
         for (uint32_t s = 0; s < max_bind_groups; s++) {
             if (!(dirty_sets_ & (1u << s)))
                 continue;
             const bound_set& bs = sets_[s];
             const bind_group* group = device_.bind_groups_.get(bs.group);
+            resolved_set& r = resolved_[s];
+            r.pipeline = pipeline_;
+            r.group = bs.group;
+            r.valid = true;
+            r.count = 0;
             for (uint32_t stage = first; stage <= last; stage++) {
                 for (const stage_slot& slot : p.stages[stage]) {
                     if (slot.set != s)
@@ -465,26 +606,20 @@ namespace conduit::d3d11 {
                             cb = mirror.get();
                         }
                         const bool offset_call = cb == b->constant.get() && ctx1_;
-                        switch (stage) {
-                        case stage_vertex:
-                            if (offset_call)
-                                ctx1_->VSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
+                        if (slot.dynamic_index != ~0u) {
+                            if (offset_call && r.count < r.constants.size() && slot.dynamic_index < 256 &&
+                                slot.slot < 256)
+                                r.constants[r.count++] = {static_cast<uint8_t>(stage),
+                                                          static_cast<uint8_t>(slot.slot),
+                                                          static_cast<uint8_t>(slot.dynamic_index),
+                                                          cb,
+                                                          e->buffer.offset,
+                                                          e->buffer.size,
+                                                          b->gpu_size};
                             else
-                                ctx_->VSSetConstantBuffers(slot.slot, 1, &cb);
-                            break;
-                        case stage_pixel:
-                            if (offset_call)
-                                ctx1_->PSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
-                            else
-                                ctx_->PSSetConstantBuffers(slot.slot, 1, &cb);
-                            break;
-                        default:
-                            if (offset_call)
-                                ctx1_->CSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
-                            else
-                                ctx_->CSSetConstantBuffers(slot.slot, 1, &cb);
-                            break;
+                                r.valid = false;
                         }
+                        bind_constant(stage, slot.slot, cb, offset_call, first_constant, constants);
                         break;
                     }
                     case resource_kind::storage_buffer:
@@ -509,6 +644,9 @@ namespace conduit::d3d11 {
                             }
                             ctx_->CSSetUnorderedAccessViews(slot.slot, 1, &uav, nullptr);
                             bound_uavs_ = (std::max)(bound_uavs_, slot.slot + 1);
+                            // binding a resource for writing pulls it out of every stage's read slots
+                            for (stage_bound& sb : bound_)
+                                sb.srvs = {};
                             break;
                         }
                         ID3D11ShaderResourceView* srv = nullptr;
@@ -527,12 +665,7 @@ namespace conduit::d3d11 {
                                                  " is gone");
                             return false;
                         }
-                        if (stage == stage_vertex)
-                            ctx_->VSSetShaderResources(slot.slot, 1, &srv);
-                        else if (stage == stage_pixel)
-                            ctx_->PSSetShaderResources(slot.slot, 1, &srv);
-                        else
-                            ctx_->CSSetShaderResources(slot.slot, 1, &srv);
+                        bind_srv(stage, slot.slot, srv);
                         bound_srvs_[stage] = (std::max)(bound_srvs_[stage], slot.slot + 1);
                         break;
                     }
@@ -543,13 +676,7 @@ namespace conduit::d3d11 {
                                                  " is gone");
                             return false;
                         }
-                        ID3D11SamplerState* state = sm->state.get();
-                        if (stage == stage_vertex)
-                            ctx_->VSSetSamplers(slot.slot, 1, &state);
-                        else if (stage == stage_pixel)
-                            ctx_->PSSetSamplers(slot.slot, 1, &state);
-                        else
-                            ctx_->CSSetSamplers(slot.slot, 1, &state);
+                        bind_sampler(stage, slot.slot, sm->state.get());
                         break;
                     }
                     }
@@ -572,17 +699,11 @@ namespace conduit::d3d11 {
             return false;
         }
         if (pipeline_dirty_) {
-            ctx_->IASetInputLayout(p->input_layout.get());
-            ctx_->IASetPrimitiveTopology(p->topology);
-            ctx_->VSSetShader(p->vs.get(), nullptr, 0);
-            ctx_->PSSetShader(p->ps.get(), nullptr, 0);
-            ctx_->RSSetState(p->raster.get());
-            ctx_->OMSetBlendState(p->blend.get(), nullptr, 0xFFFFFFFFu);
-            ctx_->OMSetDepthStencilState(p->depth_stencil.get(), stencil_ref_);
+            apply_pipeline(*p);
             pipeline_dirty_ = false;
             device_.mutable_stats().pipeline_binds++;
         }
-        if (!bind_sets(*p))
+        if ((dirty_sets_ | offsets_dirty_) && !bind_sets(*p))
             return false;
         for (uint32_t i = 0; i < p->stream_count; i++) {
             if (!(vertex_dirty_ & (1u << i)))
@@ -595,6 +716,12 @@ namespace conduit::d3d11 {
             ID3D11Buffer* buf = b->main.get();
             const UINT stride = p->strides[i];
             const UINT offset = static_cast<UINT>(vertex_[i].offset);
+            state_bound& sb = state_bound_;
+            if (sb.vertex[i] == buf && sb.stride[i] == stride && sb.offset[i] == offset)
+                continue;
+            sb.vertex[i] = buf;
+            sb.stride[i] = stride;
+            sb.offset[i] = offset;
             ctx_->IASetVertexBuffers(i, 1, &buf, &stride, &offset);
         }
         vertex_dirty_ = 0;
@@ -662,7 +789,8 @@ namespace conduit::d3d11 {
             return;
         }
         if (pipeline_dirty_) {
-            ctx_->CSSetShader(p->cs.get(), nullptr, 0);
+            if (state_bound_.fresh || state_bound_.cs != p->cs.get())
+                ctx_->CSSetShader(state_bound_.cs = p->cs.get(), nullptr, 0);
             pipeline_dirty_ = false;
         }
         if (!bind_sets(*p))
@@ -686,7 +814,8 @@ namespace conduit::d3d11 {
             return;
         }
         if (pipeline_dirty_) {
-            ctx_->CSSetShader(p->cs.get(), nullptr, 0);
+            if (state_bound_.fresh || state_bound_.cs != p->cs.get())
+                ctx_->CSSetShader(state_bound_.cs = p->cs.get(), nullptr, 0);
             pipeline_dirty_ = false;
         }
         if (!bind_sets(*p))

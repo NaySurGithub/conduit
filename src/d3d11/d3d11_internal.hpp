@@ -206,11 +206,18 @@ namespace conduit::d3d11 {
             pipeline_dirty_ = true;
             vertex_dirty_ = 0xFF;
             index_dirty_ = true;
+            reset_bound();
         }
 
     private:
         bool prepare_draw();
         bool bind_sets(const pipeline& p);
+        void reset_bound();
+        void bind_constant(uint32_t stage, uint32_t slot, ID3D11Buffer* cb, bool offset_call, UINT first,
+                           UINT constants);
+        void bind_srv(uint32_t stage, uint32_t slot, ID3D11ShaderResourceView* srv);
+        void bind_sampler(uint32_t stage, uint32_t slot, ID3D11SamplerState* state);
+        void apply_pipeline(const pipeline& p);
         void clear_bindings();
         void unbind_targets();
         void copy_to_constant(buffer& b, uint64_t offset, uint64_t size);
@@ -230,6 +237,22 @@ namespace conduit::d3d11 {
         };
         std::array<bound_set, max_bind_groups> sets_{};
         uint32_t dirty_sets_ = 0;
+        // sets rebound with the same group and only new dynamic offsets move the constant windows the last full
+        // bind resolved instead of resolving the group again
+        uint32_t offsets_dirty_ = 0;
+        struct dynamic_constant {
+            uint8_t stage = 0, slot = 0, dynamic = 0;
+            ID3D11Buffer* buffer = nullptr;
+            uint64_t base = 0, size = 0, gpu_size = 0;
+        };
+        struct resolved_set {
+            pipeline_handle pipeline;
+            bind_group_handle group;
+            bool valid = false;
+            uint32_t count = 0;
+            std::array<dynamic_constant, 8> constants{};
+        };
+        std::array<resolved_set, max_bind_groups> resolved_{};
         bool pipeline_dirty_ = true;
         struct vertex_slot {
             buffer_handle buffer;
@@ -237,6 +260,30 @@ namespace conduit::d3d11 {
         };
         std::array<vertex_slot, max_vertex_streams> vertex_{};
         uint32_t vertex_dirty_ = 0;
+        // what the deferred context already holds, so identical binds never reach the runtime. identity only:
+        // the context keeps its own reference to whatever is bound, so an address cannot be reused under it
+        static constexpr uint32_t cached_constants = 14, cached_srvs = 32, cached_samplers = 16;
+        struct stage_bound {
+            std::array<ID3D11Buffer*, cached_constants> constants{};
+            std::array<UINT, cached_constants> first{}, count{};
+            std::array<ID3D11ShaderResourceView*, cached_srvs> srvs{};
+            std::array<ID3D11SamplerState*, cached_samplers> samplers{};
+        };
+        std::array<stage_bound, 3> bound_{};
+        struct state_bound {
+            ID3D11InputLayout* input_layout = nullptr;
+            D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            ID3D11VertexShader* vs = nullptr;
+            ID3D11PixelShader* ps = nullptr;
+            ID3D11ComputeShader* cs = nullptr;
+            ID3D11RasterizerState* raster = nullptr;
+            ID3D11BlendState* blend = nullptr;
+            ID3D11DepthStencilState* depth_stencil = nullptr;
+            UINT stencil_ref = 0;
+            bool fresh = true;
+            std::array<ID3D11Buffer*, max_vertex_streams> vertex{};
+            std::array<UINT, max_vertex_streams> stride{}, offset{};
+        } state_bound_;
         buffer_handle index_buffer_;
         index_type index_type_ = index_type::u32;
         uint64_t index_offset_ = 0;
