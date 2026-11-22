@@ -7,6 +7,7 @@
 #include "gles/gles_platform.hpp"
 
 #include <atomic>
+#include <compare>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -142,6 +144,9 @@ namespace conduit::gles {
         // upload and readback buffers are plain memory on the cpu: the application writes into it through map() and
         // flush() copies it across, and readbacks land in it
         std::vector<uint8_t> shadow;
+        // set on the GL thread once the application has flushed the buffer: from then on flush() is what brings its
+        // writes across, and binds no longer upload from the shadow
+        bool flushed = false;
     };
 
     struct texture {
@@ -269,6 +274,8 @@ namespace conduit::gles {
         uint32_t attribute_count = 0;
         std::array<vertex_stream_desc, max_vertex_streams> streams{};
         uint32_t stream_count = 0;
+        // the streams any attribute reads
+        uint32_t stream_mask = 0;
         std::vector<combined_sampler> samplers;
         uint32_t color_count = 0;
         bool front_first = true;
@@ -301,6 +308,8 @@ namespace conduit::gles {
         bool border_clamp = false;
         bool map_range = false;
         bool vsync_off = false;
+        bool base_vertex = false;         // ES 3.2 or OES/EXT_draw_elements_base_vertex
+        bool multi_draw_indirect = false; // EXT_multi_draw_indirect
     };
 
     class device;
@@ -408,6 +417,12 @@ namespace conduit::gles {
         GLuint divisor = 0;
     };
 
+    struct range_binding {
+        GLuint buffer = ~0u;
+        GLintptr offset = 0;
+        GLsizeiptr size = 0;
+    };
+
     // what the GL thread believes the context is set to, so a pass that repeats itself costs no calls. a value of
     // ~0u means unknown
     struct gl_cache {
@@ -428,6 +443,9 @@ namespace conduit::gles {
         GLuint element_buffer = ~0u;
         GLfloat depth_near = -1.0f, depth_far = -1.0f;
         int unpack_row = -1, pack_row = -1;
+        std::array<range_binding, 32> uniform_ranges{};
+        std::array<GLint, 4> viewport_rect{}, scissor_rect{};
+        bool viewport_valid = false, scissor_valid = false;
         gl_cache() { reset(); }
         void reset() {
             program = draw_framebuffer = read_framebuffer = ~0u;
@@ -443,6 +461,8 @@ namespace conduit::gles {
             array_buffer = element_buffer = ~0u;
             depth_near = depth_far = -1.0f;
             unpack_row = pack_row = -1;
+            uniform_ranges.fill(range_binding{});
+            viewport_valid = scissor_valid = false;
         }
     };
 
@@ -545,8 +565,10 @@ namespace conduit::gles {
         void signal_now(fence_handle fence, uint64_t value);
         bool wait_now(fence_handle fence, uint64_t value, uint64_t timeout_ns);
 
-        // bind a texture to a unit, skipping the call when the unit already holds it
+        // bind a texture to a unit and leave that unit active, for calls that act on the bound texture
         void use_texture(uint32_t unit, GLenum target, GLuint texture);
+        // bind a texture for sampling: nothing at all when the unit already holds it
+        void sample_texture(uint32_t unit, GLenum target, GLuint texture);
         void use_program(GLuint program);
         void use_scissor_test(bool enable);
         // forget what the caches know about a GL buffer that is about to go away
@@ -567,6 +589,10 @@ namespace conduit::gles {
         pipeline_handle build_pipeline(const graphics_pipeline_desc* graphics, const compute_pipeline_desc* compute);
         void delete_framebuffers_using(GLuint gl, bool renderbuffer);
         bool format_supported(format f) const;
+        // GL thread: drops a pipeline's use of its program and deletes the program after its last user
+        void release_program(GLuint program);
+        void forget_programs(shader_handle shader);
+        void forget_programs(pipeline_layout_handle layout);
 
         gl_thread thread_;
         std::unique_ptr<gl_context> context_;
@@ -595,6 +621,25 @@ namespace conduit::gles {
         GLuint push_ring_ = 0;
         uint64_t push_ring_size_ = 0, push_ring_pos_ = 0;
         std::map<std::array<uint64_t, max_color_targets + 1>, framebuffer> framebuffers_;
+
+        // pipelines that differ only in fixed-function state share one program: its shaders are translated, compiled
+        // and linked once. entries go when a shader or layout of the key is destroyed (handle generations wrap)
+        struct program_key {
+            shader_handle vertex, fragment, compute;
+            pipeline_layout_handle layout;
+            auto operator<=>(const program_key& o) const {
+                return std::tie(vertex.value, fragment.value, compute.value, layout.value) <=>
+                       std::tie(o.vertex.value, o.fragment.value, o.compute.value, o.layout.value);
+            }
+            bool operator==(const program_key&) const = default;
+        };
+        struct shared_program {
+            GLuint program = 0;
+            std::vector<combined_sampler> samplers;
+        };
+        std::mutex program_mutex_;
+        std::map<program_key, shared_program> programs_;
+        std::unordered_map<GLuint, uint32_t> program_users_;
 
         std::mutex fence_mutex_;
         std::condition_variable fence_cv_;
