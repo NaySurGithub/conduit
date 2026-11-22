@@ -32,12 +32,32 @@ conduit_add_shader_pack(conduit_test_pack
     SLANGC "${CONDUIT_SLANGC}"
     TARGETS ${pack_targets}
     LIBRARY_PATH "${dxc_dir}"
+    CACHE "${CMAKE_CURRENT_BINARY_DIR}/shader_cache"
     PROGRAMS "${shader_root}/programs"
     DEPENDS ${programs})
 
 conduit_test(shader_library_test)
 add_dependencies(shader_library_test conduit_test_pack)
 add_test(NAME shader_library_test COMMAND shader_library_test "${pack}")
+
+conduit_test(encode_bench)
+add_dependencies(encode_bench conduit_test_pack)
+add_test(NAME encode_bench COMMAND encode_bench "${pack}" --draws 4000 --frames 40)
+
+add_executable(conduit_bench bench.cpp)
+target_link_libraries(conduit_bench PRIVATE conduit::conduit)
+add_dependencies(conduit_bench conduit_test_pack)
+add_test(NAME bench_smoke COMMAND conduit_bench "${pack}" --quick)
+
+conduit_test(render_selftest)
+add_dependencies(render_selftest conduit_test_pack)
+foreach(api VULKAN D3D12 D3D11 METAL WEBGPU)
+    if(CONDUIT_${api})
+        string(TOLOWER ${api} id)
+        add_test(NAME render_selftest_${id} COMMAND render_selftest "${pack}" ${id})
+        set_tests_properties(render_selftest_${id} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endforeach()
 
 conduit_test(pipeline_smoke)
 add_dependencies(pipeline_smoke conduit_test_pack)
