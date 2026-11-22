@@ -5,6 +5,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <conduit/device.hpp>
+#include "common/counters.hpp"
 #include "common/handle_pool.hpp"
 #include "common/shader_reflect.hpp"
 #include "common/util.hpp"
@@ -20,8 +21,22 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void* token);
+
 namespace conduit::metal {
     extern bool g_depth24_stencil8;
+
+    // metal hands back autoreleased command buffers, encoders and descriptors. a c++ engine rarely has a pool
+    // on its render or worker threads, and there they would pile up until the thread exits: every entry point
+    // that makes such objects drains its own
+    struct autorelease_scope {
+        void* token = objc_autoreleasePoolPush();
+        autorelease_scope() = default;
+        autorelease_scope(const autorelease_scope&) = delete;
+        autorelease_scope& operator=(const autorelease_scope&) = delete;
+        ~autorelease_scope() { objc_autoreleasePoolPop(token); }
+    };
 
     MTLPixelFormat to_pixel_format(format f);
     MTLVertexFormat to_vertex_format(format f);
@@ -55,18 +70,22 @@ namespace conduit::metal {
         id<MTLTexture> native = nil;
         texture_desc desc;
         std::string name;
+        uint64_t bytes = 0;
         bool external = false;
+        bool memoryless = false;
         // bumped when a swapchain image swaps its native texture, so views cached elsewhere know to look again
         std::atomic<uint32_t> epoch{0};
         texture() = default;
         texture(texture&& o) noexcept
-            : native(o.native), desc(o.desc), name(std::move(o.name)), external(o.external),
-              epoch(o.epoch.load(std::memory_order_relaxed)), views(std::move(o.views)) {}
+            : native(o.native), desc(o.desc), name(std::move(o.name)), bytes(o.bytes), external(o.external),
+              memoryless(o.memoryless), epoch(o.epoch.load(std::memory_order_relaxed)), views(std::move(o.views)) {}
         texture& operator=(texture&& o) noexcept {
             native = o.native;
             desc = o.desc;
             name = std::move(o.name);
+            bytes = o.bytes;
             external = o.external;
+            memoryless = o.memoryless;
             epoch.store(o.epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
             views = std::move(o.views);
             return *this;
@@ -185,6 +204,7 @@ namespace conduit::metal {
 
     struct query {
         uint32_t count = 0;
+        id<MTLCounterSampleBuffer> samples = nil;
     };
 
     struct fence {
@@ -201,6 +221,7 @@ namespace conduit::metal {
         queue_type queue() const override { return queue_; }
         void begin();
         id<MTLCommandBuffer> finish();
+        const list_counters& counters() const { return counters_; }
 
         void barrier(std::span<const texture_barrier> textures, std::span<const buffer_barrier> buffers) override;
         void uav_barrier(buffer_handle) override;
@@ -254,9 +275,9 @@ namespace conduit::metal {
         bool bind_sets(const pipeline& p);
         void apply_pipeline_state(const pipeline& p, id<MTLRenderPipelineState> state);
         void reset_bound();
-        void bind_buffer(uint32_t stage, uint32_t index, id<MTLBuffer> buffer, uint64_t offset);
-        void bind_texture(uint32_t stage, uint32_t index, id<MTLTexture> texture);
-        void bind_sampler(uint32_t stage, uint32_t index, id<MTLSamplerState> sampler);
+        void bind_buffer(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLBuffer> buffer, uint64_t offset);
+        void bind_texture(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLTexture> texture);
+        void bind_sampler(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLSamplerState> sampler);
 
         // what the open encoder already has, per stage: identical binds are dropped and a moved offset on the
         // same buffer goes through the cheap set*BufferOffset path. compared by identity only, never retained
@@ -289,6 +310,8 @@ namespace conduit::metal {
         id<MTLBlitCommandEncoder> blit_ = nil;
 
         pipeline_handle pipeline_;
+        const pipeline* bound_pipeline_ = nullptr;
+        list_counters counters_;
         struct bound_set {
             bind_group_handle group;
             std::array<uint32_t, max_dynamic_offsets> offsets{};
@@ -313,9 +336,11 @@ namespace conduit::metal {
         };
         std::array<resolved_set, max_bind_groups> resolved_{};
         bool pipeline_dirty_ = true;
+        // native is resolved at the first draw after the buffer changes, so moving an offset looks nothing up
         struct vertex_slot {
             buffer_handle buffer;
             uint64_t offset = 0;
+            __unsafe_unretained id<MTLBuffer> native = nil;
         };
         std::array<vertex_slot, max_vertex_streams> vertex_{};
         uint32_t vertex_dirty_ = 0;
@@ -350,6 +375,9 @@ namespace conduit::metal {
         pipeline_handle create_graphics_pipeline(const graphics_pipeline_desc& desc) override;
         pipeline_handle create_compute_pipeline(const compute_pipeline_desc& desc) override;
         query_set_handle create_query_set(const query_set_desc& desc) override;
+        void calibrate_timestamps();
+        id<MTLComputePipelineState> timestamp_marker();
+        id<MTLBuffer> timestamp_scratch() const { return timestamp_scratch_; }
 
         void destroy(buffer_handle h) override;
         void destroy(texture_handle h) override;
@@ -388,13 +416,12 @@ namespace conduit::metal {
         void wait_idle() override;
 
         memory_budget query_memory_budget() override;
-        device_stats stats() const override { return stats_; }
-        float timestamp_period_ns() const override { return 1.0f; }
+        device_stats stats() const override;
+        float timestamp_period_ns() const override { return timestamp_period_; }
 
         id<MTLDevice> dev() const { return device_; }
         id<MTLCommandQueue> queue() const { return queue_; }
         const device_options& options() const { return options_; }
-        device_stats& mutable_stats() { return stats_; }
         void report_error(const std::string& message);
         id<MTLTexture> view_of(texture& texture, const subresource_range& range, texture_dim dim, format format,
                                bool stencil);
@@ -402,6 +429,7 @@ namespace conduit::metal {
         void set_surface_texture(texture_handle handle, id<MTLTexture> texture);
         void resize_surface_texture(texture_handle handle, uint32_t width, uint32_t height);
         void signal_when_done(id<MTLCommandBuffer> after, fence_handle fence, uint64_t value);
+        void commit(id<MTLCommandBuffer> cb);
 
         handle_pool<buffer_tag, buffer> buffers_;
         handle_pool<texture_tag, texture> textures_;
@@ -412,6 +440,13 @@ namespace conduit::metal {
         handle_pool<pipeline_layout_tag, pipeline_layout> pipeline_layouts_;
         handle_pool<pipeline_tag, pipeline> pipelines_;
         handle_pool<query_set_tag, query> queries_;
+        bool memoryless_targets_ = false;
+        id<MTLCounterSet> timestamp_counters_ = nil;
+        float timestamp_period_ = 1.0f;
+        std::once_flag timestamps_calibrated_;
+        std::mutex marker_mutex_;
+        id<MTLComputePipelineState> timestamp_marker_ = nil;
+        id<MTLBuffer> timestamp_scratch_ = nil;
         handle_pool<fence_tag, fence> fences_;
 
     public:
@@ -429,9 +464,16 @@ namespace conduit::metal {
         id<MTLCommandQueue> queue_ = nil;
         device_options options_;
         device_caps caps_;
-        device_stats stats_;
+        // resources are made and destroyed on any thread, and lists fold their counts in at submit
+        device_counters counters_;
+        std::atomic<uint64_t> buffer_bytes_{0}, texture_bytes_{0}, pipelines_pending_{0};
+        std::atomic<uint32_t> live_buffers_{0}, live_textures_{0}, live_pipelines_{0}, live_bind_groups_{0};
         uint64_t frame_ = 0;
-        fence_handle frame_fence_;
+        // every committed command buffer takes the next serial and raises completed_ when the gpu is done with
+        // it, so pacing a frame needs no command buffer of its own
+        std::atomic<uint64_t> committed_{0};
+        std::shared_ptr<timeline> completed_ = std::make_shared<timeline>();
+        std::array<uint64_t, 8> frame_serials_{};
         std::mutex list_mutex_;
         std::vector<std::unique_ptr<cmd_list>> lists_;
         std::vector<cmd_list*> free_lists_;

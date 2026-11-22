@@ -23,9 +23,12 @@ namespace conduit::metal {
     }
 
     void cmd_list::begin() {
+        const autorelease_scope pool;
         end_encoder();
         command_buffer_ = [device_.queue() commandBuffer];
         pipeline_ = {};
+        bound_pipeline_ = nullptr;
+        counters_ = {};
         sets_ = {};
         vertex_ = {};
         index_buffer_ = {};
@@ -43,7 +46,8 @@ namespace conduit::metal {
         compute_bound_ = nil;
     }
 
-    void cmd_list::bind_buffer(uint32_t stage, uint32_t index, id<MTLBuffer> buffer, uint64_t offset) {
+    void cmd_list::bind_buffer(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLBuffer> buffer,
+                               uint64_t offset) {
         if (index < cached_buffers) {
             stage_bound& b = bound_[stage];
             if (b.buffers[index] == buffer) {
@@ -69,7 +73,7 @@ namespace conduit::metal {
             [compute_ setBuffer:buffer offset:offset atIndex:index];
     }
 
-    void cmd_list::bind_texture(uint32_t stage, uint32_t index, id<MTLTexture> texture) {
+    void cmd_list::bind_texture(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLTexture> texture) {
         if (index < cached_textures) {
             stage_bound& b = bound_[stage];
             if (b.textures[index] == texture)
@@ -84,7 +88,7 @@ namespace conduit::metal {
             [compute_ setTexture:texture atIndex:index];
     }
 
-    void cmd_list::bind_sampler(uint32_t stage, uint32_t index, id<MTLSamplerState> sampler) {
+    void cmd_list::bind_sampler(uint32_t stage, uint32_t index, __unsafe_unretained id<MTLSamplerState> sampler) {
         if (index < cached_samplers) {
             stage_bound& b = bound_[stage];
             if (b.samplers[index] == sampler)
@@ -123,6 +127,7 @@ namespace conduit::metal {
 
     id<MTLBlitCommandEncoder> cmd_list::blit() {
         if (!blit_) {
+            const autorelease_scope pool;
             end_encoder();
             blit_ = [command_buffer_ blitCommandEncoder];
         }
@@ -131,6 +136,7 @@ namespace conduit::metal {
 
     id<MTLComputeCommandEncoder> cmd_list::compute() {
         if (!compute_) {
+            const autorelease_scope pool;
             end_encoder();
             compute_ = [command_buffer_ computeCommandEncoder];
             dirty_sets_ = 0xF;
@@ -141,13 +147,13 @@ namespace conduit::metal {
     }
 
     void cmd_list::barrier(std::span<const texture_barrier> textures, std::span<const buffer_barrier> buffers) {
-        device_.mutable_stats().barriers += textures.size() + buffers.size();
+        counters_.barriers += textures.size() + buffers.size();
     }
     void cmd_list::uav_barrier(buffer_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
     void cmd_list::uav_barrier(texture_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
 
     void cmd_list::copy_buffer(buffer_handle dst, uint64_t dst_offset, buffer_handle src, uint64_t src_offset,
@@ -266,6 +272,7 @@ namespace conduit::metal {
             device_.report_error("ResolveTexture: bad handle");
             return;
         }
+        const autorelease_scope pool;
         end_encoder();
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         if (is_depth_format(s->desc.format)) {
@@ -281,6 +288,7 @@ namespace conduit::metal {
     }
 
     void cmd_list::begin_rendering(const rendering_desc& desc) {
+        const autorelease_scope pool;
         end_encoder();
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass_width_ = pass_height_ = 0;
@@ -303,7 +311,10 @@ namespace conduit::metal {
                             : a.load == load_op::load ? MTLLoadActionLoad
                                                       : MTLLoadActionDontCare;
             ca.clearColor = MTLClearColorMake(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);
-            const bool store = a.store == store_op::store;
+            // memory that does not exist can be neither loaded from nor stored to
+            if (t->memoryless && a.load == load_op::load)
+                ca.loadAction = MTLLoadActionDontCare;
+            const bool store = a.store == store_op::store && !t->memoryless;
             if (a.resolve) {
                 texture* r = device_.textures_.get(a.resolve);
                 if (r && r->native) {
@@ -328,13 +339,16 @@ namespace conduit::metal {
                 return;
             }
             const bool stencil = has_stencil(t->desc.format);
-            const MTLLoadAction load = desc.depth.read_only                ? MTLLoadActionLoad
-                                       : desc.depth.load == load_op::clear ? MTLLoadActionClear
-                                       : desc.depth.load == load_op::load  ? MTLLoadActionLoad
-                                                                           : MTLLoadActionDontCare;
-            const MTLStoreAction store = desc.depth.read_only || desc.depth.store == store_op::store
-                                             ? MTLStoreActionStore
-                                             : MTLStoreActionDontCare;
+            MTLLoadAction load = desc.depth.read_only                ? MTLLoadActionLoad
+                                 : desc.depth.load == load_op::clear ? MTLLoadActionClear
+                                 : desc.depth.load == load_op::load  ? MTLLoadActionLoad
+                                                                     : MTLLoadActionDontCare;
+            MTLStoreAction store = desc.depth.read_only || desc.depth.store == store_op::store ? MTLStoreActionStore
+                                                                                               : MTLStoreActionDontCare;
+            if (t->memoryless) {
+                load = load == MTLLoadActionLoad ? MTLLoadActionDontCare : load;
+                store = MTLStoreActionDontCare;
+            }
             MTLRenderPassDepthAttachmentDescriptor* da = pass.depthAttachment;
             da.texture = t->native;
             da.level = desc.depth.mip;
@@ -384,6 +398,7 @@ namespace conduit::metal {
         if (p == pipeline_)
             return;
         pipeline_ = p;
+        bound_pipeline_ = nullptr;
         pipeline_dirty_ = true;
         dirty_sets_ = 0xF;
     }
@@ -394,7 +409,7 @@ namespace conduit::metal {
         bound_set& s = sets_[set];
         const uint32_t bit = 1u << set;
         const uint32_t count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
-        device_.mutable_stats().bind_group_binds++;
+        counters_.group_binds++;
         if (s.group == group && !(dirty_sets_ & bit)) {
             if (count == s.offset_count &&
                 std::equal(dynamic_offsets.begin(), dynamic_offsets.begin() + count, s.offsets.begin()))
@@ -454,7 +469,12 @@ namespace conduit::metal {
     void cmd_list::set_vertex_buffer(uint32_t slot, buffer_handle buffer, uint64_t offset) {
         if (slot >= max_vertex_streams)
             return;
-        vertex_[slot] = {buffer, offset};
+        vertex_slot& v = vertex_[slot];
+        if (v.buffer != buffer) {
+            v.buffer = buffer;
+            v.native = nil;
+        }
+        v.offset = offset;
         vertex_dirty_ |= 1u << slot;
     }
 
@@ -541,7 +561,7 @@ namespace conduit::metal {
                     case resource_kind::sampled_texture:
                     case resource_kind::storage_texture: {
                         texture* t = device_.textures_.get(e->texture.texture);
-                        id<MTLTexture> view = nil;
+                        __unsafe_unretained id<MTLTexture> view = nil;
                         if (t) {
                             const size_t at = static_cast<size_t>(e - group->entries.data());
                             if (at < group->views.size()) {
@@ -625,10 +645,15 @@ namespace conduit::metal {
             device_.report_error("draw outside a rendering pass");
             return nullptr;
         }
-        const pipeline* p = device_.pipelines_.get(pipeline_);
-        if (!p || p->compute) {
-            device_.report_error("draw without a graphics pipeline");
-            return nullptr;
+        // looked up once per bind: a draw is far more common than a pipeline change
+        const pipeline* p = bound_pipeline_;
+        if (!p) {
+            p = device_.pipelines_.get(pipeline_);
+            if (!p || p->compute) {
+                device_.report_error("draw without a graphics pipeline");
+                return nullptr;
+            }
+            bound_pipeline_ = p;
         }
         if (pipeline_dirty_) {
             id<MTLRenderPipelineState> state = device_.ready_pipeline(*p);
@@ -636,7 +661,7 @@ namespace conduit::metal {
                 return nullptr;
             apply_pipeline_state(*p, state);
             pipeline_dirty_ = false;
-            device_.mutable_stats().pipeline_binds++;
+            counters_.pipeline_binds++;
         }
         if ((dirty_sets_ | offsets_dirty_) && !bind_sets(*p))
             return nullptr;
@@ -644,12 +669,16 @@ namespace conduit::metal {
             for (uint32_t i = 0; i < p->stream_count; i++) {
                 if (!(vertex_dirty_ & (1u << i)))
                     continue;
-                buffer* b = device_.buffers_.get(vertex_[i].buffer);
-                if (!b) {
-                    device_.report_error("draw: vertex stream " + std::to_string(i) + " is not bound");
-                    return nullptr;
+                vertex_slot& v = vertex_[i];
+                if (!v.native) {
+                    buffer* b = device_.buffers_.get(v.buffer);
+                    if (!b) {
+                        device_.report_error("draw: vertex stream " + std::to_string(i) + " is not bound");
+                        return nullptr;
+                    }
+                    v.native = b->native;
                 }
-                bind_buffer(stage_vertex, vertex_buffer_base - i, b->native, vertex_[i].offset);
+                bind_buffer(stage_vertex, vertex_buffer_base - i, v.native, v.offset);
             }
             vertex_dirty_ = 0;
         }
@@ -666,7 +695,7 @@ namespace conduit::metal {
                     vertexCount:vertex_count
                   instanceCount:instance_count
                    baseInstance:first_instance];
-        device_.mutable_stats().draws++;
+        counters_.draws++;
     }
 
     void cmd_list::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
@@ -688,7 +717,7 @@ namespace conduit::metal {
                          instanceCount:instance_count
                             baseVertex:vertex_offset
                           baseInstance:first_instance];
-        device_.mutable_stats().draws++;
+        counters_.draws++;
     }
 
     void cmd_list::draw_indexed_indirect(buffer_handle args, uint64_t offset, uint32_t max_draws, uint32_t stride) {
@@ -708,7 +737,7 @@ namespace conduit::metal {
                          indexBufferOffset:index_offset_
                             indirectBuffer:a->native
                       indirectBufferOffset:offset + static_cast<uint64_t>(i) * stride];
-        device_.mutable_stats().indirect_draws += max_draws;
+        counters_.indirect += max_draws;
     }
 
     void cmd_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle, uint64_t,
@@ -738,7 +767,7 @@ namespace conduit::metal {
         if (!bind_sets(*p))
             return;
         [enc dispatchThreadgroups:MTLSizeMake(x, y, z) threadsPerThreadgroup:p->threads];
-        device_.mutable_stats().dispatches++;
+        counters_.dispatches++;
     }
 
     void cmd_list::dispatch_indirect(buffer_handle args, uint64_t offset) {
@@ -765,11 +794,42 @@ namespace conduit::metal {
         [enc dispatchThreadgroupsWithIndirectBuffer:a->native
                                indirectBufferOffset:offset
                               threadsPerThreadgroup:p->threads];
-        device_.mutable_stats().dispatches++;
+        counters_.dispatches++;
     }
 
-    void cmd_list::write_timestamp(query_set_handle, uint32_t) {}
-    void cmd_list::resolve_queries(query_set_handle, uint32_t, uint32_t, buffer_handle, uint64_t) {}
+    void cmd_list::write_timestamp(query_set_handle set, uint32_t index) {
+        query* q = device_.queries_.get(set);
+        if (!q || !q->samples || index >= q->count)
+            return;
+        const autorelease_scope pool;
+        // counters are only sampled at encoder boundaries here, so an empty encoder marks this point in the list
+        end_encoder();
+        MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
+        d.sampleBufferAttachments[0].sampleBuffer = q->samples;
+        d.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
+        d.sampleBufferAttachments[0].endOfEncoderSampleIndex = MTLCounterDontSample;
+        // an encoder with no work samples nothing, so the marker runs a single thread
+        id<MTLComputePipelineState> state = device_.timestamp_marker();
+        if (!state)
+            return;
+        id<MTLComputeCommandEncoder> marker = [command_buffer_ computeCommandEncoderWithDescriptor:d];
+        [marker setComputePipelineState:state];
+        [marker setBuffer:device_.timestamp_scratch() offset:0 atIndex:0];
+        [marker dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [marker endEncoding];
+    }
+
+    void cmd_list::resolve_queries(query_set_handle set, uint32_t first, uint32_t count, buffer_handle dst,
+                                   uint64_t dst_offset) {
+        query* q = device_.queries_.get(set);
+        buffer* b = device_.buffers_.get(dst);
+        if (!q || !q->samples || !b || !count || first + count > q->count)
+            return;
+        [blit() resolveCounters:q->samples
+                        inRange:NSMakeRange(first, count)
+              destinationBuffer:b->native
+              destinationOffset:dst_offset];
+    }
 
     void cmd_list::begin_debug_label(const char*, uint32_t) {}
     void cmd_list::end_debug_label() {}
