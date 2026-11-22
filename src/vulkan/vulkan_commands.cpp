@@ -3,6 +3,7 @@
 #include "vulkan/vulkan_convert.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace conduit::vk {
@@ -687,6 +688,16 @@ namespace conduit::vk {
         }
         if (!have_pipeline_)
             return;
+        // the usual draw changes one set, mostly just its dynamic offset: bind it without gathering runs
+        const uint32_t dirty = dirty_sets_ & layout_sets_;
+        if (dirty && !(dirty & (dirty - 1))) {
+            const uint32_t i = static_cast<uint32_t>(std::countr_zero(dirty));
+            if (groups_[i] && native_sets_[i]) {
+                device_.fn_.vkCmdBindDescriptorSets(cmd_, pipeline_.bind_point, pipeline_.layout, i, 1,
+                                                    &native_sets_[i], dynamic_counts_[i], dynamic_offsets_[i].data());
+                dirty_sets_ = 0;
+            }
+        }
         if (dirty_sets_) {
             std::array<VkDescriptorSet, max_bind_groups> sets{};
             std::array<uint32_t, max_bind_groups * max_dynamic_offsets> offsets{};
@@ -782,7 +793,8 @@ namespace conduit::vk {
             fail("DrawIndexedIndirectCount: missing buffer, pipeline, index buffer or rendering pass");
             return;
         }
-        if (!device_.fn_.vkCmdDrawIndexedIndirectCount) {
+        // the core 1.2 entry point loads even where the drawIndirectCount feature is off, so ask the feature
+        if (!device_.caps_.features.draw_indirect_count) {
             // no count support: run every slot, as the other backends do; the culling pass zeroes the unused ones
             draw_indexed_indirect(args, offset, max_draws, stride);
             return;
